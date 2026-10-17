@@ -1,64 +1,83 @@
 <!doctype html>
 <html lang="th">
 <head>
-<link rel="icon" type="image/png" href="/logo.png">
 <meta charset="utf-8" />
+<meta name="color-scheme" content="dark" />
+<meta name="theme-color" content="#0b0b12" />
+<style>html,body{background:#0b0b12;margin:0}</style>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Airstream</title>
+<link rel="icon" type="image/png" href="/logo.png">
 <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
+<div class="aurora"><i></i><i></i><i></i></div>
+
 <div id="app">
-
-  <!-- ================= now casting (no video: remote control only) ================= -->
-  <section class="nowpanel">
-    <div class="nowpanel-head">
-      <div class="brand"><img src="/logo.png" alt="" class="logo">A<span>i</span>rstream</div>
-      <div class="target">
-        <button class="dev-btn" id="btnDevices">
-          <svg viewBox="0 0 24 24"><path d="M3 5h18v11h-8v2h5v2H6v-2h5v-2H3V5zm2 2v7h14V7H5z"/></svg>
-          <span id="devName">เลือกอุปกรณ์</span>
-          <span class="caret">▾</span>
-        </button>
-        <button class="dev-btn" id="btnSettings" title="ตั้งค่า">
-          <svg viewBox="0 0 24 24"><path d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm8.4 4a8.4 8.4 0 0 0-.1-1.2l2-1.5-2-3.4-2.3 1a8 8 0 0 0-2-1.2L15.6 3h-4l-.4 2.6c-.7.3-1.4.7-2 1.2l-2.3-1-2 3.4 2 1.5a8.4 8.4 0 0 0 0 2.4l-2 1.5 2 3.4 2.3-1c.6.5 1.3.9 2 1.2l.4 2.6h4l.4-2.6c.7-.3 1.4-.7 2-1.2l2.3 1 2-3.4-2-1.5c.1-.4.1-.8.1-1.2z"/></svg>
-        </button>
-      </div>
+  <!-- ======================= top bar ======================= -->
+  <header class="topbar">
+    <div class="brand"><img src="/logo.png" alt="" class="logo"><span class="bname">Air<b>stream</b></span></div>
+    <div class="top-actions">
+      <button class="pill" id="btnDevices">
+        <svg viewBox="0 0 24 24"><path d="M3 5h18v11h-8v2h5v2H6v-2h5v-2H3V5zm2 2v7h14V7H5z"/></svg>
+        <span id="devName">เลือกอุปกรณ์</span>
+        <svg class="chev" viewBox="0 0 24 24"><path d="M7 10l5 5 5-5z"/></svg>
+      </button>
+      <button class="iconbtn" id="btnSettings" title="ตั้งค่า">
+        <svg viewBox="0 0 24 24"><path d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm8.4 4a8.4 8.4 0 0 0-.1-1.2l2-1.5-2-3.4-2.3 1a8 8 0 0 0-2-1.2L15.6 3h-4l-.4 2.6c-.7.3-1.4.7-2 1.2l-2.3-1-2 3.4 2 1.5a8.4 8.4 0 0 0 0 2.4l-2 1.5 2 3.4 2.3-1c.6.5 1.3.9 2 1.2l.4 2.6h4l.4-2.6c.7-.3 1.4-.7 2-1.2l2.3 1 2-3.4-2-1.5c.1-.4.1-.8.1-1.2z"/></svg>
+      </button>
     </div>
+  </header>
 
-    <div class="nowpanel-body">
-      <div class="np-title" id="npTitle">ยังไม่ได้เลือกหนัง</div>
-      <div class="np-sub" id="npSub">เลือกจาก playlist แล้วกด Cast</div>
+  <main class="layout">
+    <!-- ======================= remote card ======================= -->
+    <section class="card remote">
+      <div class="art" id="art">
+        <img src="/logo.png" alt="" />
+        <span class="live" id="tState">IDLE</span>
+      </div>
+
+      <div class="np">
+        <div class="np-title" id="npTitle">ยังไม่ได้เลือกหนัง</div>
+        <div class="np-sub" id="npSub">เลือกจาก playlist แล้วกด Cast</div>
+      </div>
 
       <div class="progress">
         <div class="bar" id="bar"><div class="fill" id="fill"></div><div class="knob" id="knob"></div></div>
-        <div class="times">
-          <span id="tElapsed">00:00:00</span>
-          <span id="tState" class="state">IDLE</span>
-          <span id="tTotal">--:--:--</span>
-        </div>
+        <div class="times"><span id="tElapsed">00:00:00</span><span id="tTotal">--:--:--</span></div>
       </div>
 
       <div class="transport">
         <button class="t" id="btnBack10" title="-10 วินาที">
-          <svg viewBox="0 0 24 24"><path d="M12 5V1L7 6l5 5V7a5 5 0 1 1-5 5H5a7 7 0 1 0 7-7z"/></svg>
-          <span class="lbl">10</span>
+          <svg viewBox="0 0 24 24"><path d="M12 5V1L7 6l5 5V7a5 5 0 1 1-5 5H5a7 7 0 1 0 7-7z"/></svg><span class="lbl">10</span>
         </button>
         <button class="t big" id="btnPlayPause" title="เล่น / หยุดชั่วคราว">
-          <svg id="iconPlay" viewBox="0 0 24 24"><path d="M7 4l13 8-13 8z"/></svg>
-          <svg id="iconPause" viewBox="0 0 24 24" style="display:none"><path d="M7 4h4v16H7zM14 4h4v16h-4z"/></svg>
-        </button>
-        <button class="t" id="btnStop" title="หยุด">
-          <svg viewBox="0 0 24 24"><path d="M6 6h12v12H6z"/></svg>
+          <svg id="iconPlay" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+          <svg id="iconPause" viewBox="0 0 24 24" style="display:none"><path d="M7 5h4v14H7zM13 5h4v14h-4z"/></svg>
         </button>
         <button class="t" id="btnFwd30" title="+30 วินาที">
-          <svg viewBox="0 0 24 24"><path d="M12 5V1l5 5-5 5V7a5 5 0 1 0 5 5h2a7 7 0 1 1-7-7z"/></svg>
-          <span class="lbl">30</span>
+          <svg viewBox="0 0 24 24"><path d="M12 5V1l5 5-5 5V7a5 5 0 1 0 5 5h2a7 7 0 1 1-7-7z"/></svg><span class="lbl">30</span>
         </button>
-        <button class="t cast" id="btnCast" title="ส่งไปทีวี">
+      </div>
+
+      <div class="actions">
+        <button class="cta" id="btnCast" title="ส่งไปทีวี">
           <svg viewBox="0 0 24 24"><path d="M2 4h20v16H2V4zm2 2v8h16V6H4zm0 10v2h4a4 4 0 0 0-4-4zm8 2h8v-2h-8v2z"/></svg>
-          <span>Cast</span>
+          <span>Cast ไปทีวี</span>
         </button>
+        <button class="ghost" id="btnStop" title="หยุด">
+          <svg viewBox="0 0 24 24"><path d="M6 6h12v12H6z"/></svg><span>หยุด</span>
+        </button>
+      </div>
+
+      <div class="tracks">
+        <label class="tb"><span>เสียง</span>
+          <select id="selAudio"><option value="-1">อัตโนมัติ (ค่าเริ่มต้นของไฟล์)</option></select>
+        </label>
+        <label class="tb"><span>ซับไตเติล</span>
+          <select id="selSubs"><option value="-1">ปิด</option></select>
+        </label>
+        <button class="apply" id="btnApplyTracks" title="ใช้ค่าที่เลือกแล้ว cast ใหม่">ใช้ทันที</button>
       </div>
 
       <div class="chips" id="chips">
@@ -67,44 +86,31 @@
         <span class="chip" id="chipQuality">—</span>
         <span class="chip" id="chipProto">—</span>
       </div>
+    </section>
 
-      <!-- track pickers: populated from the real streams of the selected file -->
-      <div class="trackbar">
-        <label class="tb">
-          <span>เสียง</span>
-          <select id="selAudio"><option value="-1">อัตโนมัติ (ค่าเริ่มต้นของไฟล์)</option></select>
-        </label>
-        <label class="tb">
-          <span>ซับ</span>
-          <select id="selSubs"><option value="-1">ปิด</option></select>
-        </label>
-        <button class="apply" id="btnApplyTracks" title="ใช้ค่าที่เลือกแล้ว cast ใหม่">ใช้ทันที</button>
-      </div>
-    </div>
-  </section>
-
-  <!-- ================= playlist ================= -->
-  <section class="panel">
-    <header class="panel-head">
-      <div class="tab"><span id="plName">Playlist</span><span class="count" id="plCount">0</span></div>
-      <div class="head-actions">
-        <button class="link" id="btnPickFiles">+ เพิ่มไฟล์</button>
-        <button class="link" id="btnPickFolder">+ เพิ่มโฟลเดอร์</button>
-        <button class="link strong" id="btnNewList">+ New Playlist</button>
-      </div>
-    </header>
-    <div class="rows" id="rows"></div>
-    <div class="panel-foot">
-      <span id="footInfo">—</span>
-      <span class="spacer"></span>
-      <span id="footUrl">—</span>
-    </div>
-  </section>
+    <!-- ======================= playlist ======================= -->
+    <section class="card list">
+      <header class="list-head">
+        <div class="tab"><span id="plName">Playlist</span><span class="count" id="plCount">0</span></div>
+        <div class="head-actions">
+          <button class="chipbtn" id="btnPickFiles">＋ ไฟล์</button>
+          <button class="chipbtn" id="btnPickFolder">＋ โฟลเดอร์</button>
+          <button class="chipbtn hollow" id="btnNewList">＋ New</button>
+        </div>
+      </header>
+      <div class="rows" id="rows"></div>
+      <footer class="list-foot">
+        <span id="footInfo">—</span><span class="spacer"></span><span id="footUrl">—</span>
+      </footer>
+    </section>
+  </main>
 </div>
+
+<div class="scrim hidden" id="scrim"></div>
 
 <!-- ================= device popover ================= -->
 <div id="devPopup" class="popover hidden">
-  <div class="pop-head"><span>อุปกรณ์ในวง LAN</span><button class="icon" id="btnRefreshDevices">⟳</button></div>
+  <div class="pop-head"><span>อุปกรณ์ในวง LAN</span><button class="icon" id="btnRefreshDevices" title="ค้นหาใหม่">⟳</button></div>
   <div id="devList" class="dev-list"><div class="dev-empty">กำลังค้นหา…</div></div>
   <div class="pop-foot"><code id="mediaUrl"></code></div>
 </div>

@@ -48,7 +48,13 @@ async fn main() {
         }
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    // Open the window as soon as the listener answers (no fixed delay).
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     open_window(&url);
 
     // One app, one lifetime: the UI pings every few seconds; when the window
@@ -71,8 +77,13 @@ async fn main() {
 async fn running_instance() -> Option<u16> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     for port in 42015u16..42025 {
+        // A port we can bind is free: skip it instantly (a refused loopback
+        // connect on Windows can stall for hundreds of ms).
+        if std::net::TcpListener::bind(("0.0.0.0", port)).is_ok() {
+            continue;
+        }
         let Ok(Ok(mut s)) = tokio::time::timeout(
-            std::time::Duration::from_millis(300),
+            std::time::Duration::from_millis(1500),
             tokio::net::TcpStream::connect(("127.0.0.1", port)),
         )
         .await
@@ -114,6 +125,8 @@ fn open_window(url: &str) {
                 "--user-data-dir".into(),
                 dirs_profile().to_string_lossy().to_string(),
                 "--no-first-run".into(),
+                "--force-dark-mode".into(),
+                "--enable-features=WebUIDarkMode".into(),
                 "--disable-features=msEdgeSidebarV2".into(),
             ])
             .spawn();

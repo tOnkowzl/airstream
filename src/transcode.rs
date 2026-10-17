@@ -108,18 +108,50 @@ pub struct HwSupport {
 }
 
 pub fn detect_hw() -> HwSupport {
+    // Probing three GPU encoders costs seconds, so the verdict is cached per
+    // ffmpeg binary (path + size + mtime) and only redone when it changes.
+    let cache = crate::library::data_dir().join("hw.cache");
+    let key = ffmpeg_fingerprint();
+    if let Ok(txt) = std::fs::read_to_string(&cache) {
+        let mut it = txt.lines();
+        if it.next() == Some(key.as_str()) {
+            if let Some(flags) = it.next() {
+                let f: Vec<bool> = flags.split(',').map(|x| x == "1").collect();
+                if f.len() == 3 {
+                    return build_hw(f[0], f[1], f[2]);
+                }
+            }
+        }
+    }
+
     let out = Command::new("ffmpeg")
         .args(["-hide_banner", "-encoders"])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
         .unwrap_or_default();
-    let has = |n: &str| out.contains(n);
-    let mut usable = Vec::new();
 
-    // Listing an encoder is not proof the GPU can run it: do a 1-frame encode.
-    let nvenc = has("h264_nvenc") && smoke("h264_nvenc", &["-preset", "p5"]);
-    let amf = has("h264_amf") && smoke("h264_amf", &[]);
-    let qsv = has("h264_qsv") && smoke("h264_qsv", &[]);
+    // Listing an encoder is not proof the GPU can run it: do a 1-frame encode,
+    // all three in parallel.
+    let t = |name: &'static str, extra: &'static [&'static str], listed: bool| {
+        std::thread::spawn(move || listed && smoke(name, extra))
+    };
+    let h_n = t("h264_nvenc", &["-preset", "p5"], out.contains("h264_nvenc"));
+    let h_a = t("h264_amf", &[], out.contains("h264_amf"));
+    let h_q = t("h264_qsv", &[], out.contains("h264_qsv"));
+    let (nvenc, amf, qsv) = (
+        h_n.join().unwrap_or(false),
+        h_a.join().unwrap_or(false),
+        h_q.join().unwrap_or(false),
+    );
+    let _ = std::fs::write(
+        &cache,
+        format!("{key}\n{},{},{}\n", nvenc as u8, amf as u8, qsv as u8),
+    );
+    build_hw(nvenc, amf, qsv)
+}
+
+fn build_hw(nvenc: bool, amf: bool, qsv: bool) -> HwSupport {
+    let mut usable = Vec::new();
     if nvenc {
         usable.push("NVENC");
     }
@@ -135,6 +167,24 @@ pub fn detect_hw() -> HwSupport {
         format!("hardware encode: {}", usable.join(" + "))
     };
     HwSupport { nvenc, amf, qsv, summary }
+}
+
+fn ffmpeg_fingerprint() -> String {
+    let path = std::env::var_os("PATH")
+        .and_then(|p| {
+            std::env::split_paths(&p)
+                .map(|d| d.join("ffmpeg.exe"))
+                .find(|f| f.exists())
+        })
+        .unwrap_or_default();
+    let meta = std::fs::metadata(&path).ok();
+    let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    let mtime = meta
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{}|{size}|{mtime}", path.display())
 }
 
 fn smoke(encoder: &str, extra: &[&str]) -> bool {

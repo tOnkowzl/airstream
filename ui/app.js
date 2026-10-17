@@ -370,7 +370,7 @@ async function openDevices() {
     if (!r.devices.length) list.innerHTML = '<div class="dev-empty">ไม่พบอุปกรณ์ — ตรวจว่าอยู่ LAN เดียวกัน</div>';
     for (const d of r.devices) {
       const row = el('div', 'dev');
-      if (d.id === deviceId) row.style.background = '#f3ecff';
+      if (d.id === deviceId) row.style.background = 'rgba(166,111,224,.2)';
       row.appendChild(el('span', 'kind ' + d.kind, d.kind));
       row.appendChild(el('span', 'name', d.name));
       row.appendChild(el('span', 'addr', `${d.host}:${d.port}`));
@@ -421,3 +421,7 @@ pollPosition();
 /* heartbeat: lets the app exit when this window is closed */
 setInterval(() => fetch('/api/ping').catch(() => {}), 3000);
 fetch('/api/ping').catch(() => {});
+
+/* click outside closes popovers */
+document.getElementById('scrim').onclick = closePops;
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closePops(); });
