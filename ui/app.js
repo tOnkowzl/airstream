@@ -417,3 +417,7 @@ document.addEventListener('keydown', (e) => {
 
 boot().catch((e) => toast('โหลดไม่สำเร็จ: ' + e.message, 6000));
 pollPosition();
+
+/* heartbeat: lets the app exit when this window is closed */
+setInterval(() => fetch('/api/ping').catch(() => {}), 3000);
+fetch('/api/ping').catch(() => {});

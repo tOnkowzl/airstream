@@ -146,6 +146,10 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error
     let app = Router::new()
         .route("/", get(index))
         .route("/app.js", get(js))
+        .route("/api/ping", get(api_ping))
+        .route("/logo.png", get(logo_png))
+        .route("/logo.svg", get(logo_svg))
+        .route("/favicon.ico", get(logo_png))
         .route("/style.css", get(css))
         .route("/api/state", get(api_state))
         .route("/api/settings", get(api_get_settings).post(api_set_settings))
@@ -179,6 +183,29 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error
 }
 
 // ---------------------------------------------------------------- static UI
+
+const LOGO_PNG: &[u8] = include_bytes!("../ui/logo.png");
+const LOGO_SVG: &str = include_str!("../ui/logo.svg");
+
+/// UI heartbeat: the process exits once the window stops pinging.
+pub static LAST_PING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+async fn api_ping() -> impl IntoResponse {
+    LAST_PING.store(now_secs(), std::sync::atomic::Ordering::Relaxed);
+    Json(json!({"ok": true, "app": "airstream"}))
+}
+
+async fn logo_png() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "max-age=86400")], LOGO_PNG)
+}
+
+async fn logo_svg() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/svg+xml")], LOGO_SVG)
+}
 
 const INDEX_HTML: &str = include_str!("../ui/index.html");
 const APP_JS: &str = include_str!("../ui/app.js");

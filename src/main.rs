@@ -11,6 +11,8 @@
 //! Differences from the original: NVENC/AMF are preferred over software
 //! x264, and casting uses DLNA (plus mDNS discovery of Cast/AirPlay targets).
 
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod devices;
 mod cast;
 mod library;
@@ -29,11 +31,16 @@ async fn main() {
         )
         .init();
 
+    // Single instance: if Airstream is already running, just show its window.
+    if let Some(port) = running_instance().await {
+        open_window(&format!("http://127.0.0.1:{port}/"));
+        return;
+    }
+
     let state = Arc::new(server::AppState::new());
     let port = state.port;
     let url = format!("http://127.0.0.1:{}/", port);
 
-    // Launch the HTTP server first, then the app window.
     let st = state.clone();
     tokio::spawn(async move {
         if let Err(e) = server::serve(st).await {
@@ -44,9 +51,45 @@ async fn main() {
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     open_window(&url);
 
-    // Keep the process alive: the axum task runs forever, but make the main
-    // task wait too so the window owner does not exit early.
-    std::future::pending::<()>().await;
+    // One app, one lifetime: the UI pings every few seconds; when the window
+    // is closed the pings stop and the whole process (server included) exits.
+    let started = server::now_secs();
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let last = server::LAST_PING.load(std::sync::atomic::Ordering::Relaxed);
+        let now = server::now_secs();
+        let idle = if last == 0 { now.saturating_sub(started) } else { now.saturating_sub(last) };
+        let limit = if last == 0 { 40 } else { 12 };
+        if idle > limit {
+            tracing::info!("window closed — exiting");
+            std::process::exit(0);
+        }
+    }
+}
+
+/// Port of an already-running Airstream, if any (probes /api/ping).
+async fn running_instance() -> Option<u16> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    for port in 42015u16..42025 {
+        let Ok(Ok(mut s)) = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            tokio::net::TcpStream::connect(("127.0.0.1", port)),
+        )
+        .await
+        else {
+            continue;
+        };
+        let req = format!("GET /api/ping HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+        if s.write_all(req.as_bytes()).await.is_err() {
+            continue;
+        }
+        let mut buf = String::new();
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), s.read_to_string(&mut buf)).await;
+        if buf.contains("\"app\":\"airstream\"") {
+            return Some(port);
+        }
+    }
+    None
 }
 
 /// Opens the UI in a WebView2 app window (Edge `--app`), which gives a clean
