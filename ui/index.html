@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Airstream</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<div id="app">
+
+  <!-- ================= now casting (no video: remote control only) ================= -->
+  <section class="nowpanel">
+    <div class="nowpanel-head">
+      <div class="brand">A<span>i</span>rstream</div>
+      <div class="target">
+        <button class="dev-btn" id="btnDevices">
+          <svg viewBox="0 0 24 24"><path d="M3 5h18v11h-8v2h5v2H6v-2h5v-2H3V5zm2 2v7h14V7H5z"/></svg>
+          <span id="devName">เลือกอุปกรณ์</span>
+          <span class="caret">▾</span>
+        </button>
+        <button class="dev-btn" id="btnSettings" title="ตั้งค่า">
+          <svg viewBox="0 0 24 24"><path d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm8.4 4a8.4 8.4 0 0 0-.1-1.2l2-1.5-2-3.4-2.3 1a8 8 0 0 0-2-1.2L15.6 3h-4l-.4 2.6c-.7.3-1.4.7-2 1.2l-2.3-1-2 3.4 2 1.5a8.4 8.4 0 0 0 0 2.4l-2 1.5 2 3.4 2.3-1c.6.5 1.3.9 2 1.2l.4 2.6h4l.4-2.6c.7-.3 1.4-.7 2-1.2l2.3 1 2-3.4-2-1.5c.1-.4.1-.8.1-1.2z"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="nowpanel-body">
+      <div class="np-title" id="npTitle">ยังไม่ได้เลือกหนัง</div>
+      <div class="np-sub" id="npSub">เลือกจาก playlist แล้วกด Cast</div>
+
+      <div class="progress">
+        <div class="bar" id="bar"><div class="fill" id="fill"></div><div class="knob" id="knob"></div></div>
+        <div class="times">
+          <span id="tElapsed">00:00:00</span>
+          <span id="tState" class="state">IDLE</span>
+          <span id="tTotal">--:--:--</span>
+        </div>
+      </div>
+
+      <div class="transport">
+        <button class="t" id="btnBack10" title="-10 วินาที">
+          <svg viewBox="0 0 24 24"><path d="M12 5V1L7 6l5 5V7a5 5 0 1 1-5 5H5a7 7 0 1 0 7-7z"/></svg>
+          <span class="lbl">10</span>
+        </button>
+        <button class="t big" id="btnPlayPause" title="เล่น / หยุดชั่วคราว">
+          <svg id="iconPlay" viewBox="0 0 24 24"><path d="M7 4l13 8-13 8z"/></svg>
+          <svg id="iconPause" viewBox="0 0 24 24" style="display:none"><path d="M7 4h4v16H7zM14 4h4v16h-4z"/></svg>
+        </button>
+        <button class="t" id="btnStop" title="หยุด">
+          <svg viewBox="0 0 24 24"><path d="M6 6h12v12H6z"/></svg>
+        </button>
+        <button class="t" id="btnFwd30" title="+30 วินาที">
+          <svg viewBox="0 0 24 24"><path d="M12 5V1l5 5-5 5V7a5 5 0 1 0 5 5h2a7 7 0 1 1-7-7z"/></svg>
+          <span class="lbl">30</span>
+        </button>
+        <button class="t cast" id="btnCast" title="ส่งไปทีวี">
+          <svg viewBox="0 0 24 24"><path d="M2 4h20v16H2V4zm2 2v8h16V6H4zm0 10v2h4a4 4 0 0 0-4-4zm8 2h8v-2h-8v2z"/></svg>
+          <span>Cast</span>
+        </button>
+      </div>
+
+      <div class="chips" id="chips">
+        <span class="chip" id="chipDev">no device</span>
+        <span class="chip" id="chipMode">—</span>
+        <span class="chip" id="chipQuality">—</span>
+        <span class="chip" id="chipProto">—</span>
+      </div>
+
+      <!-- track pickers: populated from the real streams of the selected file -->
+      <div class="trackbar">
+        <label class="tb">
+          <span>เสียง</span>
+          <select id="selAudio"><option value="-1">อัตโนมัติ (ค่าเริ่มต้นของไฟล์)</option></select>
+        </label>
+        <label class="tb">
+          <span>ซับ</span>
+          <select id="selSubs"><option value="-1">ปิด</option></select>
+        </label>
+        <button class="apply" id="btnApplyTracks" title="ใช้ค่าที่เลือกแล้ว cast ใหม่">ใช้ทันที</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= playlist ================= -->
+  <section class="panel">
+    <header class="panel-head">
+      <div class="tab"><span id="plName">Playlist</span><span class="count" id="plCount">0</span></div>
+      <div class="head-actions">
+        <button class="link" id="btnPickFiles">+ เพิ่มไฟล์</button>
+        <button class="link" id="btnPickFolder">+ เพิ่มโฟลเดอร์</button>
+        <button class="link strong" id="btnNewList">+ New Playlist</button>
+      </div>
+    </header>
+    <div class="rows" id="rows"></div>
+    <div class="panel-foot">
+      <span id="footInfo">—</span>
+      <span class="spacer"></span>
+      <span id="footUrl">—</span>
+    </div>
+  </section>
+</div>
+
+<!-- ================= device popover ================= -->
+<div id="devPopup" class="popover hidden">
+  <div class="pop-head"><span>อุปกรณ์ในวง LAN</span><button class="icon" id="btnRefreshDevices">⟳</button></div>
+  <div id="devList" class="dev-list"><div class="dev-empty">กำลังค้นหา…</div></div>
+  <div class="pop-foot"><code id="mediaUrl"></code></div>
+</div>
+
+<!-- ================= settings (Airflow-style) ================= -->
+<div id="setPopup" class="popover wide hidden">
+  <div class="pop-head"><span>ตั้งค่า</span><button class="icon" id="btnCloseSet">✕</button></div>
+  <div class="set-body">
+
+    <div class="group">
+      <div class="group-title">คุณภาพ / การแปลง</div>
+      <label class="row2">
+        <span>Quality</span>
+        <select id="sQuality">
+          <option value="passthrough">passthrough — ไม่แปลง (เร็วสุด)</option>
+          <option value="variable-720p">variable-720p</option>
+          <option value="variable-1080p">variable-1080p</option>
+          <option value="variable-1080p-hq">variable-1080p-hq (คุณภาพสูง)</option>
+        </select>
+      </label>
+      <label class="row2">
+        <span>Encoder</span>
+        <select id="sEncoder">
+          <option value="auto">อัตโนมัติ (GPU ก่อน)</option>
+          <option value="nvenc">NVENC</option>
+          <option value="amf">AMF</option>
+          <option value="qsv">QSV</option>
+          <option value="x264">libx264 (CPU)</option>
+        </select>
+      </label>
+      <label class="row2">
+        <span>HLS segment</span>
+        <select id="sSegment">
+          <option value="2">2 วินาที</option>
+          <option value="4">4 วินาที</option>
+          <option value="6">6 วินาที</option>
+          <option value="10">10 วินาที</option>
+        </select>
+      </label>
+    </div>
+
+    <div class="group">
+      <div class="group-title">เสียง / ซับ</div>
+      <label class="row2">
+        <span>ภาษาเสียงที่ชอบ</span>
+        <select id="sAudioLang">
+          <option value="AUTO">อัตโนมัติ</option>
+          <option value="TH">ไทย</option>
+          <option value="EN">อังกฤษ</option>
+          <option value="JP">ญี่ปุ่น</option>
+          <option value="KO">เกาหลี</option>
+        </select>
+      </label>
+      <label class="row2">
+        <span>ภาษาซับที่ชอบ</span>
+        <select id="sSubLang">
+          <option value="NONE">ไม่แสดง</option>
+          <option value="TH">ไทย</option>
+          <option value="EN">อังกฤษ</option>
+          <option value="TH;NONE">ไทย แล้วปิด</option>
+        </select>
+      </label>
+      <label class="row2 check">
+        <span>แสดงซับ (burn-in)</span>
+        <input type="checkbox" id="sSubRender" />
+      </label>
+      <label class="row2">
+        <span>ขนาดซับ ×</span>
+        <input type="range" min="0.6" max="2" step="0.1" id="sSubScale" />
+      </label>
+    </div>
+
+    <div class="group">
+      <div class="group-title">การเล่น</div>
+      <label class="row2 check"><span>เล่นอัตโนมัติใน playlist</span><input type="checkbox" id="sAutoPlay" /></label>
+      <label class="row2 check"><span>วนซ้ำ playlist</span><input type="checkbox" id="sLoop" /></label>
+      <label class="row2 check"><span>จำตำแหน่งล่าสุด (resume)</span><input type="checkbox" id="sResume" /></label>
+    </div>
+
+    <div class="group">
+      <div class="group-title">ระบบ</div>
+      <dl>
+        <dt>เวอร์ชัน</dt><dd id="setVersion">—</dd>
+        <dt>Hardware</dt><dd id="setHw">—</dd>
+        <dt>LAN URL</dt><dd><code id="setUrl">—</code></dd>
+        <dt>Prefs</dt><dd><code id="setPrefs">—</code></dd>
+      </dl>
+      <button class="wide" id="btnOpenPrefs">เปิดโฟลเดอร์ข้อมูล</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+<script src="/app.js"></script>
+</body>
+</html>
