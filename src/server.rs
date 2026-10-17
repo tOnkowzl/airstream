@@ -629,7 +629,13 @@ fn start_prepare(
         } else {
             cmd.args(["-map", "0:a:0?"]);
         }
-        let mode = st2.transcoder.pick_mode(quality, passthrough_ok, &encoder);
+        // Clearest picture = no generation loss: when the source video is already
+        // TV-decodable and nothing must be burned in, copy it bit-for-bit.
+        let mode = if passthrough_ok && sub_track < 0 && quality != Quality::V720 {
+            crate::transcode::Mode::Passthrough
+        } else {
+            st2.transcoder.pick_mode(quality, passthrough_ok, &encoder)
+        };
         let vf_sub = if sub_track >= 0 {
             Some(format!(
                 "subtitles=filename='{}':si={}:force_style='Fontsize={}'",
