@@ -643,7 +643,7 @@ fn start_prepare(
         let scale = if quality == Quality::V720 {
             "scale='min(1280,iw)':-2"
         } else {
-            "scale='min(1920,iw)':-2"
+            "scale='min(3840,iw)':-2"
         };
         let vf = match &vf_sub {
             Some(s) => format!("{scale},{s}"),
@@ -654,20 +654,34 @@ fn start_prepare(
                 cmd.args(["-c:v", "copy"]);
             }
             crate::transcode::Mode::Nvenc => {
-                cmd.args(["-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq", "-rc", "vbr",
-                          "-cq", "21", "-b:v", "0", "-maxrate", "14M", "-bufsize", "28M",
+                cmd.args(["-c:v", "h264_nvenc", "-preset", "p7", "-tune", "hq", "-rc", "vbr", "-multipass", "fullres",
+                          "-cq", "15", "-b:v", "0", "-maxrate", "40M", "-bufsize", "80M",
+                          "-spatial-aq", "1", "-temporal-aq", "1", "-rc-lookahead", "32",
                           "-profile:v", "high", "-pix_fmt", "yuv420p", "-g", "48", "-vf", &vf]);
             }
             crate::transcode::Mode::X264 => {
-                cmd.args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
-                          "-maxrate", "14M", "-bufsize", "28M", "-pix_fmt", "yuv420p",
+                cmd.args(["-c:v", "libx264", "-preset", "slow", "-crf", "16",
+                          "-maxrate", "40M", "-bufsize", "80M", "-pix_fmt", "yuv420p",
                           "-g", "48", "-vf", &vf]);
             }
             _ => {
-                cmd.args(["-c:v", "h264_nvenc", "-preset", "p5", "-cq", "21", "-pix_fmt", "yuv420p", "-vf", &vf]);
+                cmd.args(["-c:v", "h264_nvenc", "-preset", "p7", "-cq", "15", "-pix_fmt", "yuv420p", "-vf", &vf]);
             }
         }
-        cmd.args(["-c:a", "aac", "-b:a", "192k", "-ac", "2"])
+        // Audio: bit-exact copy for AAC/AC3/E-AC3 (mp4-safe, TV decodes natively);
+        // otherwise high-bitrate AAC keeping the original channel layout (no downmix).
+        let (acodec, ach) = {
+            let mi = crate::probe::probe(&path);
+            let idx = if audio_n >= 0 { audio_n as usize } else { 0 };
+            mi.audio_tracks.get(idx).map(|t| (t.codec.clone(), t.channels)).unwrap_or_default()
+        };
+        if matches!(acodec.as_str(), "aac" | "ac3" | "eac3") {
+            cmd.args(["-c:a", "copy"]);
+        } else {
+            let ch = ach.clamp(1, 6);
+            cmd.args(["-c:a", "aac", "-b:a", &format!("{}k", (96 * ch.max(2)).min(640)), "-ac", &ch.to_string()]);
+        }
+        cmd.args(["-sn"])
             .args(["-movflags", "+faststart", "-f", "mp4"])
             .arg(&tmp)
             .stdout(std::process::Stdio::null())
