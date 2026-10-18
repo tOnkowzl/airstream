@@ -239,6 +239,7 @@ function pumpProbes() {
 async function pollPosition() {
   try {
     const p = await api('/api/position');
+    updateSpeed(p.playback_rate || 1, p.via === 'cast' && ['PLAYING','PAUSED','BUFFERING'].includes(p.state));
     if (p.state === 'NO_DEVICE') { $('#tState').textContent = 'NO DEVICE'; $('#tState').className = 'state'; return; }
     position = p;
     const total = p.duration > 0 ? p.duration : (items.find((i) => i.id === selected)?.duration || 0);
@@ -468,4 +469,30 @@ $('#selSubs').addEventListener('change', () => {
 $('#selAudio').addEventListener('change', scheduleSave);
 $('#sSubRender').addEventListener('change', () => {
   if (!$('#sSubRender').checked) $('#selSubs').value = '-1';
+});
+
+let rateBusy = false, confirmedRate = 1, rateAvailable = false;
+function updateSpeed(rate, available) {
+  confirmedRate = rate;
+  rateAvailable = available;
+  document.querySelectorAll('[data-playback-rate]').forEach(b => {
+    const active = Math.abs(Number(b.dataset.playbackRate) - rate) < 0.01;
+    b.classList.toggle('active', active);
+    b.setAttribute('aria-pressed', String(active));
+    b.disabled = rateBusy || !available;
+  });
+  $('#rateStatus').textContent = rateBusy ? 'รอทีวียืนยัน…' : available ? `ทีวียืนยัน ×${rate}` : 'เริ่ม Cast ก่อน';
+}
+document.querySelectorAll('[data-playback-rate]').forEach(button => {
+  button.addEventListener('click', async () => {
+    if (rateBusy) return;
+    rateBusy = true;
+    updateSpeed(confirmedRate, rateAvailable);
+    try {
+      const result = await post('/api/rate', {rate:Number(button.dataset.playbackRate)});
+      confirmedRate = result.rate;
+      toast(`ความเร็ว ×${result.rate}`);
+    } catch (e) { toast(e.message, 6500); }
+    finally { rateBusy = false; updateSpeed(confirmedRate, rateAvailable); await pollPosition(); }
+  });
 });

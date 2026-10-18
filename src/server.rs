@@ -149,6 +149,7 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error
         .route("/", get(index))
         .route("/app.js", get(js))
         .route("/api/ping", get(api_ping))
+        .route("/api/rate", post(api_rate))
         .route("/subtitles/:id/:track", get(subtitle_vtt))
         .route("/api/subtitle_debug", get(subtitle_debug))
         .route("/logo.png", get(logo_png))
@@ -961,6 +962,39 @@ async fn api_transport(State(st): State<Arc<AppState>>, Json(req): Json<Transpor
 }
 
 #[derive(Deserialize)]
+struct RateReq { rate: f64 }
+
+async fn api_rate(State(st): State<Arc<AppState>>, Json(req): Json<RateReq>) -> Response {
+    if !req.rate.is_finite() || ![1.0, 2.0, 3.0].contains(&req.rate) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error":"Choose playback speed x1, x2 or x3."}))).into_response();
+    }
+    let Some(client) = st.cast.lock().unwrap().clone() else {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error":"เริ่ม Cast ไปทีวีก่อนเปลี่ยนความเร็ว"}))).into_response();
+    };
+    let _lock = client.rate_lock.lock().await;
+    let initial = client.status();
+    if !initial.connected || !matches!(initial.player_state.as_str(), "PLAYING" | "PAUSED" | "BUFFERING") {
+        return (StatusCode::CONFLICT, Json(json!({"error":"ไม่มีหนังที่กำลังเล่นบน Google Cast"}))).into_response();
+    }
+    let Some(request_id) = client.set_playback_rate(req.rate) else {
+        return (StatusCode::BAD_GATEWAY, Json(json!({"error":"Cast channel is closed"}))).into_response();
+    };
+    for attempt in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let status = client.status();
+        if status.last_error_request_id == request_id && !status.last_error.is_empty() {
+            return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error":format!("ทีวีไม่ยอมรับความเร็ว ×{} — ยังคง ×{}",req.rate,status.playback_rate),"rate":status.playback_rate,"detail":status.last_error}))).into_response();
+        }
+        if status.status_revision > initial.status_revision && (status.playback_rate - req.rate).abs() < 0.01 {
+            return Json(json!({"ok":true,"rate":status.playback_rate,"confirmed_by_receiver":true})).into_response();
+        }
+        if attempt % 4 == 3 { client.request_status(); }
+    }
+    let actual = client.status().playback_rate;
+    (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error":format!("ทีวีไม่ได้ยืนยัน ×{} (รายงานปัจจุบัน ×{}) — ไม่ได้แปลงไฟล์เพื่อลดคุณภาพ",req.rate,actual),"rate":actual}))).into_response()
+}
+
+#[derive(Deserialize)]
 struct SeekReq {
     seconds: f64,
 }
@@ -1010,6 +1044,7 @@ async fn api_position(State(st): State<Arc<AppState>>, Query(q): Query<PosQuery>
             "duration": s.duration,
             "state": state,
             "via": "cast",
+            "playback_rate": s.playback_rate,
             "title": s.title,
         }));
     }

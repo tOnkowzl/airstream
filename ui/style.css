@@ -175,3 +175,8 @@ button.wide:hover{background:rgba(255,255,255,.1)}
 @media (max-width:900px){.layout{grid-template-columns:1fr;overflow:auto}.card{min-height:360px}}
 .t:not(.big) svg{width:28px;height:28px}
 .t .lbl{font-size:8.5px;font-weight:800;transform:translate(-50%,-44%);letter-spacing:-.02em}
+
+.playback-speed{display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap;margin:2px 0 18px;color:var(--muted);font-size:12px}
+.rate-btn{border:1px solid rgba(255,255,255,.13);background:rgba(255,255,255,.04);color:inherit;border-radius:9px;padding:7px 13px;cursor:pointer;font:inherit;font-weight:700;transition:background .15s,border-color .15s}
+.rate-btn.active{background:rgba(167,139,250,.2);border-color:rgba(167,139,250,.7);color:#e9ddff}
+.rate-btn:disabled{opacity:.4;cursor:not-allowed}.rate-btn:focus-visible{outline:2px solid #c4b5fd;outline-offset:3px}.rate-status{font-size:11px;max-width:210px}

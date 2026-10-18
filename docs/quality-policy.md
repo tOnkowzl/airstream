@@ -26,3 +26,9 @@ The separately labeled conversion modes are lossy, not Original quality. SDR bur
 - Explicit SDR burn-in still rendered Thai glyphs; media Range delivery matched the prepared file. Returning to Original/no-subtitle mode recovered source-identical decoded pixels.
 
 These checks verify the sender and receiver protocol behavior for the tested inputs. They do not certify Atmos reproduction at speakers, all Dolby Vision/HDR profiles, every receiver, or universally fastest wall-clock startup. Startup can still require full-file remuxing; Original mode avoids full-film video encoding solely to display text subtitles.
+
+## Playback speed (v0.1.5)
+
+The remote includes x1/x2/x3 buttons. They issue native Cast `SET_PLAYBACK_RATE`; the selected button changes only after receiver status confirms the rate. No server-side media conversion is used to emulate speed. API validation, per-session request serialization, error correlation and status readback avoid reporting an unsupported rate as success. A new LOAD starts at x1.
+
+Real receiver SKWAMX5M confirmed x1 and x2, and position advancement was measured against wall-clock time. It rejected x3 with `INVALID_REQUEST / INVALID_PARAMS`; the UI reports that rejection and retains the receiver-confirmed speed instead of pretending x3 worked. Other receivers may have different rate limits. Media bytes stayed unchanged throughout testing.

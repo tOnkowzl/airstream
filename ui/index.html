@@ -60,6 +60,13 @@
         </button>
       </div>
 
+      <div class="playback-speed" role="group" aria-label="ความเร็วการเล่น">
+        <span>ความเร็ว</span>
+        <button type="button" class="rate-btn active" data-playback-rate="1" aria-pressed="true" disabled>×1</button>
+        <button type="button" class="rate-btn" data-playback-rate="2" aria-pressed="false" disabled>×2</button>
+        <button type="button" class="rate-btn" data-playback-rate="3" aria-pressed="false" disabled>×3</button>
+        <span class="rate-status" id="rateStatus" aria-live="polite">เริ่ม Cast ก่อน</span>
+      </div>
       <div class="actions">
         <button class="cta" id="btnCast" title="ส่งไปทีวี">
           <svg viewBox="0 0 24 24"><path d="M2 4h20v16H2V4zm2 2v8h16V6H4zm0 10v2h4a4 4 0 0 0-4-4zm8 2h8v-2h-8v2z"/></svg>

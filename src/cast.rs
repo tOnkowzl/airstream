@@ -32,6 +32,9 @@ pub struct CastStatus {
     pub connected: bool,
     pub player_state: String,
     pub current_time: f64,
+    pub playback_rate: f64,
+    pub status_revision: u64,
+    pub last_error_request_id: u64,
     pub duration: f64,
     pub title: String,
     pub transport_id: String,
@@ -52,6 +55,8 @@ pub struct CastClient {
     tx: mpsc::UnboundedSender<Cmd>,
     pub status: Arc<Mutex<CastStatus>>,
     pub name: String,
+    request_id: Arc<AtomicU64>,
+    pub rate_lock: tokio::sync::Mutex<()>,
 }
 
 impl CastClient {
@@ -61,6 +66,13 @@ impl CastClient {
 
     pub fn send(&self, namespace: &str, dest: &str, payload: Value) -> bool {
         self.tx.send(Cmd::Send(namespace.into(), dest.into(), payload)).is_ok()
+    }
+
+    pub fn set_playback_rate(&self, rate: f64) -> Option<u64> {
+        let st = self.status();
+        if st.transport_id.is_empty() || st.media_session_id == 0 { return None }
+        let id = self.request_id.fetch_add(1, Ordering::Relaxed);
+        if self.send(NS_MEDIA, &st.transport_id, json!({"type":"SET_PLAYBACK_RATE", "requestId":id, "mediaSessionId":st.media_session_id, "playbackRate":rate})) { Some(id) } else { None }
     }
 
     pub fn play(&self) -> bool {
@@ -199,7 +211,7 @@ pub async fn connect(host: &str, port: u16, device_name: &str) -> Result<CastCli
 
     let (mut rd, mut wr) = tokio::io::split(tls);
     let (tx, mut rx) = mpsc::unbounded_channel::<Cmd>();
-    let status = Arc::new(Mutex::new(CastStatus { connected: true, ..Default::default() }));
+    let status = Arc::new(Mutex::new(CastStatus { connected: true, playback_rate: 1.0, ..Default::default() }));
     let req_id = Arc::new(AtomicU64::new(1));
 
     // writer task
@@ -238,7 +250,7 @@ pub async fn connect(host: &str, port: u16, device_name: &str) -> Result<CastCli
         json!({"type":"GET_STATUS","requestId":req_id.fetch_add(1, Ordering::Relaxed)}),
     ));
 
-    let client = CastClient { tx: tx.clone(), status: status.clone(), name: device_name.to_string() };
+    let client = CastClient { tx: tx.clone(), status: status.clone(), name: device_name.to_string(), request_id: req_id.clone(), rate_lock: tokio::sync::Mutex::new(()) };
 
     // reader task: keeps status fresh and drives LAUNCH -> CONNECT -> LOAD
     let status_r = status.clone();
@@ -327,14 +339,17 @@ pub async fn connect(host: &str, port: u16, device_name: &str) -> Result<CastCli
                     }
                     NS_MEDIA => {
                         let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                        if ty == "LOAD_FAILED" || ty == "INVALID_REQUEST" || ty == "LOAD_CANCELLED" {
+                        if ty == "LOAD_FAILED" || ty == "INVALID_REQUEST" || ty == "LOAD_CANCELLED" || ty == "INVALID_PLAYER_STATE" {
                             let mut s = status_r.lock().unwrap();
                             let detail = payload.chars().take(700).collect::<String>();
                             s.last_error = format!("{ty}: {detail}");
+                            s.last_error_request_id = v.get("requestId").and_then(|x| x.as_u64()).unwrap_or(0);
                         }
                         if let Some(arr) = v.get("status").and_then(|x| x.as_array()) {
                             if let Some(st) = arr.first() {
                                 let mut s = status_r.lock().unwrap();
+                                s.status_revision += 1;
+                                if let Some(rate) = st.get("playbackRate").and_then(|x| x.as_f64()) { s.playback_rate = rate; }
                                 if let Some(ids) = st.get("activeTrackIds").and_then(|x| x.as_array()) {
                                     s.active_track_ids = ids.iter().filter_map(|x| x.as_i64()).collect();
                                 }
@@ -398,12 +413,13 @@ pub fn load(client: &CastClient, url: &str, title: &str, hls: bool, subtitle: Op
         status.last_error.clear();
         status.player_state = "LOADING".into();
         status.current_time = 0.0;
+        status.playback_rate = 1.0;
         status.active_track_ids.clear();
         status.media_tracks.clear();
     }
     let content_type = if hls { "application/x-mpegurl" } else { "video/mp4" };
     let mut payload = json!({
-        "type": "LOAD", "autoplay": true, "currentTime": 0, "activeTrackIds": [],
+        "type": "LOAD", "autoplay": true, "currentTime": 0, "activeTrackIds": [], "playbackRate": 1.0,
         "media": {
             "contentId": url, "streamType": if hls { "LIVE" } else { "BUFFERED" },
             "contentType": content_type, "metadata": { "type": 0, "title": title }, "tracks": []
