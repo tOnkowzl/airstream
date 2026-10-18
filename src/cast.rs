@@ -405,7 +405,7 @@ pub async fn connect(host: &str, port: u16, device_name: &str) -> Result<CastCli
 }
 
 /// Loads a media URL into the (already launched) Default Media Receiver.
-pub fn load(client: &CastClient, url: &str, title: &str, hls: bool, subtitle: Option<Value>, subtitle_scale: f64) -> bool {
+pub fn load(client: &CastClient, url: &str, title: &str, hls: bool, subtitle: Option<Value>, subtitle_scale: f64, playback_rate: f64) -> bool {
     let st = client.status();
     if st.transport_id.is_empty() { return false }
     {
@@ -419,7 +419,7 @@ pub fn load(client: &CastClient, url: &str, title: &str, hls: bool, subtitle: Op
     }
     let content_type = if hls { "application/x-mpegurl" } else { "video/mp4" };
     let mut payload = json!({
-        "type": "LOAD", "autoplay": true, "currentTime": 0, "activeTrackIds": [], "playbackRate": 1.0,
+        "type": "LOAD", "autoplay": true, "currentTime": 0, "activeTrackIds": [], "playbackRate": playback_rate,
         "media": {
             "contentId": url, "streamType": if hls { "LIVE" } else { "BUFFERED" },
             "contentType": content_type, "metadata": { "type": 0, "title": title }, "tracks": []

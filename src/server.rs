@@ -253,8 +253,11 @@ async fn api_get_settings(State(st): State<Arc<AppState>>) -> impl IntoResponse 
 }
 
 async fn api_set_settings(State(st): State<Arc<AppState>>, Json(s): Json<Settings>) -> impl IntoResponse {
+    if !valid_playback_rate(s.playback_rate) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error":"เลือกความเร็ว ×1, ×1.25, ×1.5, ×1.75, ×2 หรือ ×3"}))).into_response();
+    }
     st.save_settings(s.clone());
-    Json(json!({ "ok": true, "settings": s }))
+    Json(json!({ "ok": true, "settings": s })).into_response()
 }
 
 #[derive(Deserialize)]
@@ -587,7 +590,7 @@ async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> 
             )
                 .into_response();
         }
-        if !crate::cast::load(&client, &url, &item.title, false, native_subtitle.clone(), settings.subtitle_scale) {
+        if !crate::cast::load(&client, &url, &item.title, false, native_subtitle.clone(), settings.subtitle_scale, settings.playback_rate) {
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({"error":"cast channel closed", "url": url})),
@@ -961,12 +964,16 @@ async fn api_transport(State(st): State<Arc<AppState>>, Json(req): Json<Transpor
     }
 }
 
+fn valid_playback_rate(rate: f64) -> bool {
+    rate.is_finite() && [1.0, 1.25, 1.5, 1.75, 2.0, 3.0].contains(&rate)
+}
+
 #[derive(Deserialize)]
 struct RateReq { rate: f64 }
 
 async fn api_rate(State(st): State<Arc<AppState>>, Json(req): Json<RateReq>) -> Response {
-    if !req.rate.is_finite() || ![1.0, 2.0, 3.0].contains(&req.rate) {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error":"Choose playback speed x1, x2 or x3."}))).into_response();
+    if !valid_playback_rate(req.rate) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error":"เลือกความเร็ว ×1, ×1.25, ×1.5, ×1.75, ×2 หรือ ×3"}))).into_response();
     }
     let Some(client) = st.cast.lock().unwrap().clone() else {
         return (StatusCode::BAD_REQUEST, Json(json!({"error":"เริ่ม Cast ไปทีวีก่อนเปลี่ยนความเร็ว"}))).into_response();

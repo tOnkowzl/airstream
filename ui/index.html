@@ -61,11 +61,16 @@
       </div>
 
       <div class="playback-speed" role="group" aria-label="ความเร็วการเล่น">
-        <span>ความเร็ว</span>
-        <button type="button" class="rate-btn active" data-playback-rate="1" aria-pressed="true" disabled>×1</button>
-        <button type="button" class="rate-btn" data-playback-rate="2" aria-pressed="false" disabled>×2</button>
-        <button type="button" class="rate-btn" data-playback-rate="3" aria-pressed="false" disabled>×3</button>
-        <span class="rate-status" id="rateStatus" aria-live="polite">เริ่ม Cast ก่อน</span>
+        <span>ความเร็วการเล่น</span>
+        <div class="rate-grid">
+          <button type="button" class="rate-btn active" data-playback-rate="1" aria-pressed="true">×1</button>
+          <button type="button" class="rate-btn" data-playback-rate="1.25" aria-pressed="false">×1.25</button>
+          <button type="button" class="rate-btn" data-playback-rate="1.5" aria-pressed="false">×1.5</button>
+          <button type="button" class="rate-btn" data-playback-rate="1.75" aria-pressed="false">×1.75</button>
+          <button type="button" class="rate-btn" data-playback-rate="2" aria-pressed="false">×2</button>
+          <button type="button" class="rate-btn" data-playback-rate="3" aria-pressed="false">×3</button>
+        </div>
+        <span class="rate-status" id="rateStatus" aria-live="polite">เลือกไว้ก่อน Cast ได้</span>
       </div>
       <div class="actions">
         <button class="cta" id="btnCast" title="ส่งไปทีวี">

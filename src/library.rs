@@ -67,6 +67,8 @@ pub struct Prefs {
 /// `subtitleScaleAdjustment`) so an existing Airflow profile maps 1:1.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Settings {
+    #[serde(default = "normal_playback_rate")]
+    pub playback_rate: f64,
     /// passthrough | variable-720p | variable-1080p | variable-1080p-hq
     pub quality: String,
     /// auto | nvenc | amf | qsv | x264
@@ -92,9 +94,12 @@ pub struct Settings {
     pub subtitle_track: i32,
 }
 
+fn normal_playback_rate() -> f64 { 1.0 }
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            playback_rate: 1.0,
             quality: "passthrough".into(),
             encoder: "auto".into(),
             audio_language: "TH".into(),

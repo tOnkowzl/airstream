@@ -27,8 +27,8 @@ The separately labeled conversion modes are lossy, not Original quality. SDR bur
 
 These checks verify the sender and receiver protocol behavior for the tested inputs. They do not certify Atmos reproduction at speakers, all Dolby Vision/HDR profiles, every receiver, or universally fastest wall-clock startup. Startup can still require full-file remuxing; Original mode avoids full-film video encoding solely to display text subtitles.
 
-## Playback speed (v0.1.5)
+## Playback speed (v0.1.6)
 
-The remote includes x1/x2/x3 buttons. They issue native Cast `SET_PLAYBACK_RATE`; the selected button changes only after receiver status confirms the rate. No server-side media conversion is used to emulate speed. API validation, per-session request serialization, error correlation and status readback avoid reporting an unsupported rate as success. A new LOAD starts at x1.
+The remote includes x1/x1.25/x1.5/x1.75/x2/x3 buttons, matching the final requested choices (no x2.5). Speed can be selected without an active Cast session and is saved in settings. A new LOAD carries the preselected rate. Active playback uses native Cast `SET_PLAYBACK_RATE`, and the selected playing-rate indicator changes only after receiver confirmation. No media conversion is used to emulate speed. Validation, per-session serialization, error correlation and status readback prevent reporting an unsupported rate as success. Cast waits for a pending speed save, avoiding an immediate-click race.
 
-Real receiver SKWAMX5M confirmed x1 and x2, and position advancement was measured against wall-clock time. It rejected x3 with `INVALID_REQUEST / INVALID_PARAMS`; the UI reports that rejection and retains the receiver-confirmed speed instead of pretending x3 worked. Other receivers may have different rate limits. Media bytes stayed unchanged throughout testing.
+Real receiver SKWAMX5M confirmed x1, x1.25, x1.5, x1.75 and x2. Tests verified offline selection, persistence through a full executable restart, initial LOAD at preselected x1.5, and clock advancement during playback. The receiver rejected x3 with `INVALID_REQUEST / INVALID_PARAMS`; the app reports the rejection and retains the receiver-confirmed playing speed. Other receivers may have different limits. Media bytes stayed unchanged.

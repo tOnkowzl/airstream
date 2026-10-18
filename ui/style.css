@@ -180,3 +180,5 @@ button.wide:hover{background:rgba(255,255,255,.1)}
 .rate-btn{border:1px solid rgba(255,255,255,.13);background:rgba(255,255,255,.04);color:inherit;border-radius:9px;padding:7px 13px;cursor:pointer;font:inherit;font-weight:700;transition:background .15s,border-color .15s}
 .rate-btn.active{background:rgba(167,139,250,.2);border-color:rgba(167,139,250,.7);color:#e9ddff}
 .rate-btn:disabled{opacity:.4;cursor:not-allowed}.rate-btn:focus-visible{outline:2px solid #c4b5fd;outline-offset:3px}.rate-status{font-size:11px;max-width:210px}
+
+.playback-speed{flex-direction:column;gap:7px}.rate-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;width:min(100%,340px)}.rate-grid .rate-btn{padding:7px 4px}.rate-status{max-width:100%;text-align:center}

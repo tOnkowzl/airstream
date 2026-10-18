@@ -62,6 +62,8 @@ async function boot() {
 }
 
 function fillSettings(s) {
+  preferredRate = Number(s.playback_rate) || 1;
+  updateSpeed(confirmedRate, rateAvailable);
   $('#sQuality').value = s.quality || 'variable-1080p';
   $('#sEncoder').value = s.encoder || 'auto';
   $('#sSegment').value = String(s.hls_segment || 4);
@@ -76,6 +78,7 @@ function fillSettings(s) {
 
 function readSettings() {
   return {
+    playback_rate: preferredRate,
     quality: $('#sQuality').value,
     encoder: $('#sEncoder').value,
     hls_segment: parseInt($('#sSegment').value, 10) || 4,
@@ -283,6 +286,9 @@ async function castItem(id) {
   const it = items.find((x) => x.id === id);
   toast(`กำลังส่ง ${it ? it.title : ''} …`, 4000);
   try {
+    // A speed click can still be persisting when Cast is clicked immediately.
+    for (let i = 0; rateBusy && i < 100; i++) await new Promise(r => setTimeout(r, 50));
+    if (rateBusy) throw new Error('กำลังบันทึกความเร็ว กรุณาลองกด Cast อีกครั้ง');
     await loadTracks(id);
     clearTimeout(saveTimer);
     const settings = {...readSettings(), last_item: id};
@@ -471,27 +477,36 @@ $('#sSubRender').addEventListener('change', () => {
   if (!$('#sSubRender').checked) $('#selSubs').value = '-1';
 });
 
-let rateBusy = false, confirmedRate = 1, rateAvailable = false;
+let rateBusy = false, confirmedRate = 1, preferredRate = 1, rateAvailable = false;
 function updateSpeed(rate, available) {
   confirmedRate = rate;
   rateAvailable = available;
+  const shown = available ? rate : preferredRate;
   document.querySelectorAll('[data-playback-rate]').forEach(b => {
-    const active = Math.abs(Number(b.dataset.playbackRate) - rate) < 0.01;
+    const active = Math.abs(Number(b.dataset.playbackRate) - shown) < 0.01;
     b.classList.toggle('active', active);
     b.setAttribute('aria-pressed', String(active));
-    b.disabled = rateBusy || !available;
+    b.disabled = rateBusy;
   });
-  $('#rateStatus').textContent = rateBusy ? 'รอทีวียืนยัน…' : available ? `ทีวียืนยัน ×${rate}` : 'เริ่ม Cast ก่อน';
+  $('#rateStatus').textContent = rateBusy ? 'กำลังบันทึก / รอทีวียืนยัน…' : available ? `ทีวียืนยัน ×${rate}` : `พร้อมเล่น ×${preferredRate} — เลือกไว้ก่อน Cast ได้`;
 }
 document.querySelectorAll('[data-playback-rate]').forEach(button => {
   button.addEventListener('click', async () => {
-    if (rateBusy) return;
+    if (rateBusy || !STATE) return;
+    const wanted = Number(button.dataset.playbackRate);
     rateBusy = true;
     updateSpeed(confirmedRate, rateAvailable);
     try {
-      const result = await post('/api/rate', {rate:Number(button.dataset.playbackRate)});
-      confirmedRate = result.rate;
-      toast(`ความเร็ว ×${result.rate}`);
+      if (rateAvailable) {
+        const result = await post('/api/rate', {rate:wanted});
+        confirmedRate = result.rate;
+      }
+      const settings = await api('/api/settings');
+      settings.playback_rate = wanted;
+      await post('/api/settings', settings);
+      preferredRate = wanted;
+      STATE.prefs.settings.playback_rate = wanted;
+      toast(rateAvailable ? `ความเร็ว ×${confirmedRate}` : `เลือก ×${wanted} ไว้แล้ว — ใช้เมื่อกด Cast`);
     } catch (e) { toast(e.message, 6500); }
     finally { rateBusy = false; updateSpeed(confirmedRate, rateAvailable); await pollPosition(); }
   });
