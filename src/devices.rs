@@ -27,6 +27,7 @@ pub struct Device {
 pub async fn discover() -> Vec<Device> {
     let mdns = tokio::task::spawn_blocking(discover_mdns);
     let ssdp = tokio::task::spawn_blocking(discover_ssdp);
+    let direct = tokio::spawn(discover_cast_direct());
     let mut out = Vec::new();
     if let Ok(mut a) = mdns.await {
         out.append(&mut a);
@@ -34,9 +35,75 @@ pub async fn discover() -> Vec<Device> {
     if let Ok(mut b) = ssdp.await {
         out.append(&mut b);
     }
+    if let Ok(mut found) = direct.await { out.append(&mut found); }
     // de-duplicate by name
     let mut seen = std::collections::HashSet::new();
     out.retain(|d| seen.insert(d.name.clone()));
+    out
+}
+
+/// Bounded unicast fallback on the active private LAN /24. Multicast may
+/// be filtered even when the TV's Cast service is reachable. Only accept a
+/// host after both port 8009 and the Cast identity endpoint are verified.
+async fn discover_cast_direct() -> Vec<Device> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let Ok(route) = UdpSocket::bind("0.0.0.0:0") else { return Vec::new() };
+    if route.connect("8.8.8.8:80").is_err() { return Vec::new() }
+    let Ok(addr) = route.local_addr() else { return Vec::new() };
+    let std::net::IpAddr::V4(local) = addr.ip() else { return Vec::new() };
+    if !local.is_private() { return Vec::new() }
+    let oct = local.octets();
+    let mut jobs = tokio::task::JoinSet::new();
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(32));
+    for last in 1..=254u8 {
+        if last == oct[3] { continue }
+        let permits = permits.clone();
+        let host = format!("{}.{}.{}.{}", oct[0], oct[1], oct[2], last);
+        jobs.spawn(async move {
+            let _permit = permits.acquire().await.ok()?;
+            let identify = async {
+                let cast = tokio::net::TcpStream::connect((host.as_str(), 8009)).await.ok()?;
+                drop(cast);
+                let mut stream = tokio::net::TcpStream::connect((host.as_str(), 8008)).await.ok()?;
+                let req = format!("GET /setup/eureka_info?params=name,device_info HTTP/1.1\r\nHost: {host}:8008\r\nConnection: close\r\n\r\n");
+                stream.write_all(req.as_bytes()).await.ok()?;
+                let mut response = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = stream.read(&mut chunk).await.ok()?;
+                    if n == 0 { break }
+                    response.extend_from_slice(&chunk[..n]);
+                    if response.len() > 65536 { return None }
+                    if let Some(end) = response.windows(4).position(|w| w == [13, 10, 13, 10]) {
+                        let head = std::str::from_utf8(&response[..end]).ok()?;
+                        let length = head.lines().filter_map(|line| line.split_once(':'))
+                            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                            .and_then(|(_, value)| value.trim().parse::<usize>().ok());
+                        if let Some(length) = length {
+                            if response.len() >= end + 4 + length { break }
+                        }
+                    }
+                }
+                let text = String::from_utf8(response).ok()?;
+                let (head, body) = text.split_once("\r\n\r\n")?;
+                if !head.lines().next()?.contains(" 200 ") { return None }
+                let info: serde_json::Value = serde_json::from_str(body).ok()?;
+                let name = info.get("name")?.as_str()?.to_string();
+                let uuid = info.get("ssdp_udn")?.as_str()?.replace('-', "");
+                Some(Device {
+                    id: format!("cast:{name}-{uuid}._googlecast._tcp.local."),
+                    name, kind: "cast".into(), host: host.clone(), port: 8009,
+                    model: info.pointer("/device_info/model_name").and_then(|x| x.as_str()).unwrap_or("Google Cast").into(),
+                    location: String::new(), control_url: String::new(),
+                })
+            };
+            tokio::time::timeout(Duration::from_millis(700), identify).await.ok().flatten()
+        });
+    }
+    let mut out = Vec::new();
+    while let Some(result) = jobs.join_next().await {
+        if let Ok(Some(device)) = result { out.push(device); }
+    }
     out
 }
 
