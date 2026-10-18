@@ -451,7 +451,13 @@ async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> 
     };
 
     // A plain MP4 the receiver can decode is streamed straight from disk.
-    let direct_ok = quality == Quality::Passthrough && mi.passthrough_ok && is_mp4;
+    let (audio_track, subtitle_track) = clamp_tracks(&mi, settings.audio_track, settings.subtitle_track);
+    if subtitle_track >= 0 && !mi.sub_tracks[subtitle_track as usize].burnable {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error":"Selected bitmap subtitles cannot be burned in by this renderer; choose a text subtitle track."}))).into_response();
+    }
+    let cache_key = preparation_key(&item.path, quality, &settings.encoder, audio_track, subtitle_track, settings.subtitle_scale);
+    let direct_ok = quality == Quality::Passthrough && mi.passthrough_ok && is_mp4
+        && subtitle_track < 0 && audio_track < 0;
 
     let (url, mode, quality_label) = if direct_ok {
         (
@@ -463,18 +469,19 @@ async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> 
         // Everything else is prepared once into a faststart MP4: the Cast
         // receiver on this TV rejects live HLS, but plays MP4 with Range
         // requests — which is also what makes exact seeking work.
-        let file = prepared_path(&item.id);
+        let file = prepared_path(&cache_key);
         if !file.exists() {
             start_prepare(
                 &st,
                 &item.id,
+                &cache_key,
                 &item.path,
                 mi.passthrough_ok,
                 quality,
                 &settings.encoder,
                 mi.duration,
-                settings.audio_track,
-                settings.subtitle_track,
+                audio_track,
+                subtitle_track,
                 settings.subtitle_scale,
             );
             return Json(json!({
@@ -485,12 +492,14 @@ async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> 
             }))
             .into_response();
         }
-        let mode = match quality {
+        let mode = if subtitle_track >= 0 {
+            "prepared with burned-in subtitles".to_string()
+        } else { match quality {
             Quality::Passthrough => "remux (copy)".to_string(),
             _ => format!("prepared {}", quality.label()),
-        };
+        }};
         (
-            format!("http://{}:{}/prepared/{}", st.lan_ip, st.port, item.id),
+            format!("http://{}:{}/prepared/{}", st.lan_ip, st.port, cache_key),
             mode,
             quality.label().to_string(),
         )
@@ -613,6 +622,25 @@ fn prepared_dir() -> PathBuf {
     d
 }
 
+// Versioned cache identity includes every setting that changes output. Never
+// reuse a no-subtitle render after the user selects a subtitle or audio track.
+fn preparation_key(path: &str, quality: Quality, encoder: &str, audio: i32, sub: i32, scale: f64) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    "prepared-v3-subtitles".hash(&mut h);
+    path.hash(&mut h);
+    if let Ok(m) = std::fs::metadata(path) {
+        m.len().hash(&mut h);
+        m.modified().ok().hash(&mut h);
+    }
+    quality.label().hash(&mut h);
+    encoder.hash(&mut h);
+    audio.hash(&mut h);
+    sub.hash(&mut h);
+    scale.to_bits().hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
 fn prepared_path(id: &str) -> PathBuf {
     prepared_dir().join(format!("{id}.mp4"))
 }
@@ -622,6 +650,7 @@ fn prepared_path(id: &str) -> PathBuf {
 fn start_prepare(
     st: &Arc<AppState>,
     item_id: &str,
+    cache_key: &str,
     path: &str,
     passthrough_ok: bool,
     quality: Quality,
@@ -646,7 +675,7 @@ fn start_prepare(
             PrepState {
                 state: "preparing".into(),
                 progress: 0.0,
-                file: prepared_path(item_id).to_string_lossy().to_string(),
+                file: prepared_path(cache_key).to_string_lossy().to_string(),
                 note: quality.label().to_string(),
             },
         );
@@ -654,10 +683,11 @@ fn start_prepare(
 
     let st2 = st.clone();
     let item_id = item_id.to_string();
+    let cache_key = cache_key.to_string();
     let path = path.to_string();
     let encoder = encoder.to_string();
     tokio::spawn(async move {
-        let out = prepared_path(&item_id);
+        let out = prepared_path(&cache_key);
         let tmp = out.with_extension("part.mp4");
         let mut cmd = tokio::process::Command::new("ffmpeg");
         cmd.arg("-hide_banner").args(["-loglevel", "info", "-nostdin", "-y"]);
@@ -673,18 +703,30 @@ fn start_prepare(
         let mode = if passthrough_ok && sub_track < 0 && quality != Quality::V720 {
             crate::transcode::Mode::Passthrough
         } else {
-            st2.transcoder.pick_mode(quality, passthrough_ok, &encoder)
+            st2.transcoder.pick_mode(if sub_track >= 0 && quality == Quality::Passthrough { Quality::V1080Hq } else { quality }, passthrough_ok && sub_track < 0, &encoder)
         };
+        // Extract subtitles beside the output and use a relative, ASCII-only
+        // filter filename. This avoids Windows drive-colon/quote escaping bugs.
+        let subtitle_file = format!("{cache_key}.ass");
+        if sub_track >= 0 {
+            let extraction = tokio::process::Command::new("ffmpeg")
+                .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i"])
+                .arg(&path).args(["-map", &format!("0:s:{sub_track}"), "-c:s", "ass"])
+                .arg(prepared_dir().join(&subtitle_file)).output().await;
+            let error = match extraction {
+                Ok(o) if o.status.success() => None,
+                Ok(o) => Some(String::from_utf8_lossy(&o.stderr).chars().take(1200).collect::<String>()),
+                Err(e) => Some(e.to_string()),
+            };
+            if let Some(error) = error {
+                if let Some(p) = st2.prep.lock().unwrap().get_mut(&item_id) { p.state = "error".into(); p.note = error; }
+                return;
+            }
+        }
+        cmd.current_dir(prepared_dir());
         let vf_sub = if sub_track >= 0 {
-            Some(format!(
-                "subtitles=filename='{}':si={}:force_style='Fontsize={}'",
-                path.replace('\\', "/").replace(':', "\\:").replace('\'', "\\'"),
-                sub_track,
-                (18.0 * sub_scale.clamp(0.6, 2.0)).round() as u32
-            ))
-        } else {
-            None
-        };
+            Some(format!("subtitles=filename={}:force_style='FontName=Tahoma,Fontsize={}'", subtitle_file, (18.0 * sub_scale.clamp(0.6, 2.0)).round() as u32))
+        } else { None };
         let scale = if quality == Quality::V720 {
             "scale='min(1280,iw)':-2"
         } else {
@@ -743,6 +785,7 @@ fn start_prepare(
             }
         };
 
+        let mut diagnostics = String::new();
         // ffmpeg rewrites its progress line with '\r', so split on both \r and \n.
         if let Some(mut err) = child.stderr.take() {
             use tokio::io::AsyncReadExt;
@@ -771,6 +814,9 @@ fn start_prepare(
                                 }
                             }
                         }
+                        diagnostics.push_str(&line);
+                        diagnostics.push('\n');
+                        if diagnostics.len() > 8000 { diagnostics = diagnostics.chars().rev().take(4000).collect::<String>().chars().rev().collect(); }
                         line.clear();
                     } else if line.len() < 2000 {
                         line.push(b as char);
@@ -781,7 +827,10 @@ fn start_prepare(
         let status = child.wait().await;
         let ok = matches!(status, Ok(s) if s.success()) && tmp.exists();
         if ok {
-            let _ = std::fs::rename(&tmp, &out);
+            if let Err(e) = std::fs::rename(&tmp, &out) {
+                if let Some(p) = st2.prep.lock().unwrap().get_mut(&item_id) { p.state = "error".into(); p.note = e.to_string(); }
+                return;
+            }
             if let Some(p) = st2.prep.lock().unwrap().get_mut(&item_id) {
                 p.state = "ready".into();
                 p.progress = 100.0;
@@ -790,7 +839,7 @@ fn start_prepare(
             let _ = std::fs::remove_file(&tmp);
             if let Some(p) = st2.prep.lock().unwrap().get_mut(&item_id) {
                 p.state = "error".into();
-                p.note = "ffmpeg failed (see ffmpeg output)".into();
+                p.note = format!("ffmpeg failed: {}", diagnostics.chars().rev().take(2000).collect::<String>().chars().rev().collect::<String>());
             }
         }
     });

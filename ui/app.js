@@ -82,7 +82,7 @@ function readSettings() {
     audioLanguages: $('#sAudioLang').value,
     audio_stream: '',
     subtitleLanguages: $('#sSubLang').value,
-    subtitleRendering: $('#sSubRender').checked,
+    subtitleRendering: parseInt($('#selSubs').value, 10) >= 0,
     subtitleScaleAdjustment: parseFloat($('#sSubScale').value) || 1,
     audio_track: parseInt($('#selAudio').value, 10),
     subtitle_track: parseInt($('#selSubs').value, 10),
@@ -177,6 +177,9 @@ async function loadTracks(id) {
     const st = STATE.prefs.settings || {};
     if (st.audio_track >= 0) a.value = String(st.audio_track);
     if (st.subtitle_track >= 0) s.value = String(st.subtitle_track);
+    if (!s.value) s.value = '-1';
+    if (!a.value) a.value = '-1';
+    $('#sSubRender').checked = parseInt(s.value, 10) >= 0;
     // auto-pick preferred language when nothing explicit is chosen
     if (st.audio_track === -1 && st.audioLanguages) {
       const pref = st.audioLanguages.toUpperCase();
@@ -442,3 +445,13 @@ async function primeDevices() {
 }
 primeDevices();
 setInterval(primeDevices, 1500);
+
+// Selecting a subtitle is the on/off control; keep the advanced toggle in sync.
+$('#selSubs').addEventListener('change', () => {
+  $('#sSubRender').checked = parseInt($('#selSubs').value, 10) >= 0;
+  scheduleSave();
+});
+$('#selAudio').addEventListener('change', scheduleSave);
+$('#sSubRender').addEventListener('change', () => {
+  if (!$('#sSubRender').checked) $('#selSubs').value = '-1';
+});
