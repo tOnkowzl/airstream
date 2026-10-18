@@ -84,7 +84,7 @@ impl AppState {
             pipes: crate::stream::PipeRegistry::new(),
             port,
             lan_ip,
-            devices: Mutex::new(Vec::new()),
+            devices: Mutex::new(std::fs::read(crate::library::data_dir().join("devices-cache.json")).ok().and_then(|v| serde_json::from_slice(&v).ok()).unwrap_or_default()),
             now: Mutex::new(NowPlaying::default()),
             cast: Mutex::new(None),
             prep: Mutex::new(std::collections::HashMap::new()),
@@ -396,13 +396,25 @@ async fn api_thumb(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> R
     }
 }
 
+// Snapshot only: network discovery never blocks the UI request.
 async fn api_devices(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let list = devices::discover().await;
-    {
-        let mut cache = st.devices.lock().unwrap();
-        *cache = list.clone();
-    }
+    let list = st.devices.lock().unwrap().clone();
     Json(json!({ "devices": list }))
+}
+
+pub fn start_device_discovery(st: Arc<AppState>) {
+    tokio::spawn(async move {
+        loop {
+            let list = devices::discover().await;
+            // An empty scan is authoritative for this session (no ghost TVs).
+            *st.devices.lock().unwrap() = list.clone();
+            if let Ok(data) = serde_json::to_vec(&list) {
+                let path = crate::library::data_dir().join("devices-cache.json");
+                let _ = tokio::fs::write(path, data).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        }
+    });
 }
 
 #[derive(Deserialize)]

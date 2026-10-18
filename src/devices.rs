@@ -5,12 +5,12 @@
 //! This implementation uses mDNS for discovery of Cast/AirPlay targets and
 //! SSDP + DLNA AVTransport for the actual push, which every modern TV accepts.
 
-use serde::Serialize;
+use serde::{Serialize, Deserialize};
 use std::io::{Read, Write};
 use std::net::{TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Device {
     pub id: String,
     pub name: String,
@@ -18,9 +18,9 @@ pub struct Device {
     pub host: String,
     pub port: u16,
     pub model: String,
-    #[serde(skip)]
+    #[serde(default)]
     pub location: String,
-    #[serde(skip)]
+    #[serde(default)]
     pub control_url: String,
 }
 

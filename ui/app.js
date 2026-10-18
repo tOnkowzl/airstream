@@ -359,15 +359,18 @@ $('#btnNewList').onclick = () => toast('หลาย playlist จะมาใน
 /* ----------------------------- devices ----------------------------- */
 function closePops() { $('#devPopup').classList.add('hidden'); $('#setPopup').classList.add('hidden'); }
 
+let knownDevices = [];
 async function openDevices() {
   closePops();
   $('#devPopup').classList.remove('hidden');
   const list = $('#devList');
-  list.innerHTML = '<div class="dev-empty">กำลังค้นหา (mDNS + SSDP)… ~3 วินาที</div>';
+  // Keep the existing list visible while refreshing the snapshot.
+  if (!list.children.length) list.innerHTML = '<div class="dev-empty">กำลังค้นหาอุปกรณ์เบื้องหลัง…</div>';
   try {
     const r = await api('/api/devices');
     list.innerHTML = '';
-    if (!r.devices.length) list.innerHTML = '<div class="dev-empty">ไม่พบอุปกรณ์ — ตรวจว่าอยู่ LAN เดียวกัน</div>';
+    knownDevices = r.devices;
+    if (!r.devices.length) list.innerHTML = '<div class="dev-empty">ยังไม่พบอุปกรณ์ — กำลังค้นหาเบื้องหลัง ตรวจว่าทีวีอยู่ LAN เดียวกัน</div>';
     for (const d of r.devices) {
       const row = el('div', 'dev');
       if (d.id === deviceId) row.style.background = 'rgba(166,111,224,.2)';
@@ -425,3 +428,17 @@ fetch('/api/ping').catch(() => {});
 /* click outside closes popovers */
 document.getElementById('scrim').onclick = closePops;
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closePops(); });
+
+// Prime the device menu during startup, not after the user clicks it.
+async function primeDevices() {
+  try {
+    const r = await api('/api/devices');
+    knownDevices = r.devices || [];
+    const last = STATE?.prefs?.settings?.last_device;
+    const d = knownDevices.find(x => x.id === (deviceId || last));
+    if (d) { deviceId = d.id; $('#devName').textContent = d.name; }
+    if (!$('#devPopup').classList.contains('hidden')) await openDevices();
+  } catch {}
+}
+primeDevices();
+setInterval(primeDevices, 1500);

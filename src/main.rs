@@ -38,6 +38,7 @@ async fn main() {
     }
 
     let state = Arc::new(server::AppState::new());
+    server::start_device_discovery(state.clone());
     let port = state.port;
     let url = format!("http://127.0.0.1:{}/", port);
 
