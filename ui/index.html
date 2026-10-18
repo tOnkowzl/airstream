@@ -122,13 +122,14 @@
 
     <div class="group">
       <div class="group-title">คุณภาพ / การแปลง</div>
+      <p class="hint">แนะนำ “ต้นฉบับ + ซับแยก”: คงภาพ 10-bit และเสียงเดิม ไม่แปลงหรือลดช่องเสียงอัตโนมัติ หากทีวีไม่รองรับจะแจ้งข้อผิดพลาดแทนการลดคุณภาพ</p>
       <label class="row2">
         <span>Quality</span>
         <select id="sQuality">
-          <option value="passthrough">passthrough — ไม่แปลง (เร็วสุด)</option>
-          <option value="variable-720p">variable-720p</option>
-          <option value="variable-1080p">variable-1080p</option>
-          <option value="variable-1080p-hq">variable-1080p-hq (คุณภาพสูง)</option>
+          <option value="passthrough">ต้นฉบับ + ซับแยก — ไม่ลดคุณภาพ</option>
+          <option value="variable-720p">720p — ลดคุณภาพ / ฝังซับ</option>
+          <option value="variable-1080p">1080p — แปลงภาพ / ฝังซับ</option>
+          <option value="variable-1080p-hq">ฝังซับ HQ — ต้องเข้ารหัสภาพใหม่</option>
         </select>
       </label>
       <label class="row2">
@@ -174,7 +175,7 @@
         </select>
       </label>
       <label class="row2 check">
-        <span>แสดงซับ (burn-in)</span>
+        <span>เปิดซับที่เลือก</span>
         <input type="checkbox" id="sSubRender" />
       </label>
       <label class="row2">

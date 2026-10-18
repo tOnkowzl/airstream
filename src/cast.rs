@@ -37,6 +37,8 @@ pub struct CastStatus {
     pub transport_id: String,
     pub media_session_id: i64,
     pub last_error: String,
+    pub active_track_ids: Vec<i64>,
+    pub media_tracks: Vec<Value>,
     /// last few raw channel messages, for diagnostics
     pub log: Vec<String>,
 }
@@ -333,6 +335,12 @@ pub async fn connect(host: &str, port: u16, device_name: &str) -> Result<CastCli
                         if let Some(arr) = v.get("status").and_then(|x| x.as_array()) {
                             if let Some(st) = arr.first() {
                                 let mut s = status_r.lock().unwrap();
+                                if let Some(ids) = st.get("activeTrackIds").and_then(|x| x.as_array()) {
+                                    s.active_track_ids = ids.iter().filter_map(|x| x.as_i64()).collect();
+                                }
+                                if let Some(tracks) = st.pointer("/media/tracks").and_then(|x| x.as_array()) {
+                                    s.media_tracks = tracks.clone();
+                                }
                                 if let Some(t) = st.get("currentTime").and_then(|x| x.as_f64()) {
                                     s.current_time = t;
                                 }
@@ -382,25 +390,33 @@ pub async fn connect(host: &str, port: u16, device_name: &str) -> Result<CastCli
 }
 
 /// Loads a media URL into the (already launched) Default Media Receiver.
-pub fn load(client: &CastClient, url: &str, title: &str, hls: bool) -> bool {
+pub fn load(client: &CastClient, url: &str, title: &str, hls: bool, subtitle: Option<Value>, subtitle_scale: f64) -> bool {
     let st = client.status();
-    if st.transport_id.is_empty() {
-        return false;
+    if st.transport_id.is_empty() { return false }
+    {
+        let mut status = client.status.lock().unwrap();
+        status.last_error.clear();
+        status.player_state = "LOADING".into();
+        status.current_time = 0.0;
+        status.active_track_ids.clear();
+        status.media_tracks.clear();
     }
     let content_type = if hls { "application/x-mpegurl" } else { "video/mp4" };
-    client.send(
-        NS_MEDIA,
-        &st.transport_id,
-        json!({
-            "type": "LOAD",
-            "autoplay": true,
-            "currentTime": 0,
-            "media": {
-                "contentId": url,
-                "streamType": if hls { "LIVE" } else { "BUFFERED" },
-                "contentType": content_type,
-                "metadata": { "type": 0, "title": title }
-            }
-        }),
-    )
+    let mut payload = json!({
+        "type": "LOAD", "autoplay": true, "currentTime": 0, "activeTrackIds": [],
+        "media": {
+            "contentId": url, "streamType": if hls { "LIVE" } else { "BUFFERED" },
+            "contentType": content_type, "metadata": { "type": 0, "title": title }, "tracks": []
+        }
+    });
+    if let Some(track) = subtitle {
+        payload["media"]["tracks"] = json!([track]);
+        payload["activeTrackIds"] = json!([1]);
+        payload["media"]["textTrackStyle"] = json!({
+            "fontScale": subtitle_scale.clamp(0.6, 2.0), "fontFamily": "sans-serif",
+            "foregroundColor": "#FFFFFFFF", "backgroundColor": "#00000000",
+            "edgeType": "OUTLINE", "edgeColor": "#000000FF"
+        });
+    }
+    client.send(NS_MEDIA, &st.transport_id, payload)
 }

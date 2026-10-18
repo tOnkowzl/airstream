@@ -95,7 +95,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            quality: "variable-1080p".into(),
+            quality: "passthrough".into(),
             encoder: "auto".into(),
             audio_language: "TH".into(),
             audio_stream: String::new(),

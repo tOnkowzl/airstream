@@ -51,6 +51,7 @@ pub struct AppState {
     pub cast: Mutex<Option<Arc<crate::cast::CastClient>>>,
     /// Prepared (faststart) MP4 files: cast targets that support exact seeking.
     pub prep: Mutex<std::collections::HashMap<String, PrepState>>,
+    pub subtitle_fetches: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -88,6 +89,7 @@ impl AppState {
             now: Mutex::new(NowPlaying::default()),
             cast: Mutex::new(None),
             prep: Mutex::new(std::collections::HashMap::new()),
+            subtitle_fetches: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -147,6 +149,8 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error
         .route("/", get(index))
         .route("/app.js", get(js))
         .route("/api/ping", get(api_ping))
+        .route("/subtitles/:id/:track", get(subtitle_vtt))
+        .route("/api/subtitle_debug", get(subtitle_debug))
         .route("/logo.png", get(logo_png))
         .route("/logo.svg", get(logo_svg))
         .route("/favicon.ico", get(logo_png))
@@ -455,15 +459,43 @@ async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> 
     if subtitle_track >= 0 && !mi.sub_tracks[subtitle_track as usize].burnable {
         return (StatusCode::BAD_REQUEST, Json(json!({"error":"Selected bitmap subtitles cannot be burned in by this renderer; choose a text subtitle track."}))).into_response();
     }
-    let cache_key = preparation_key(&item.path, quality, &settings.encoder, audio_track, subtitle_track, settings.subtitle_scale);
-    let direct_ok = quality == Quality::Passthrough && mi.passthrough_ok && is_mp4
-        && subtitle_track < 0 && audio_track < 0;
+    let native = quality == Quality::Passthrough;
+    let native_video_ok = matches!(mi.vcodec.as_str(), "h264" | "hevc");
+    // Original quality is strict: no silent 10-bit->8-bit, codec conversion or
+    // audio downmix when a receiver does not support the original stream.
+    if native && !native_video_ok {
+        return (StatusCode::UNSUPPORTED_MEDIA_TYPE, Json(json!({"error": "Original-quality playback supports H.264/HEVC here. Refusing silent video conversion."}))).into_response();
+    }
+    if !native && (mi.bit_depth > 8 || mi.hdr) {
+        return (StatusCode::UNSUPPORTED_MEDIA_TYPE, Json(json!({"error": "This source is 10/12-bit or HDR. Choose Original quality + separate subtitles; refusing precision loss or unverified HDR conversion."}))).into_response();
+    }
+    let audio_index = if audio_track >= 0 { audio_track as usize } else { 0 };
+    if let Some(audio) = mi.audio_tracks.get(audio_index) {
+        if !matches!(audio.codec.as_str(), "aac" | "ac3" | "eac3" | "alac" | "mp3") {
+            return (StatusCode::UNSUPPORTED_MEDIA_TYPE, Json(json!({"error": format!("Original {} audio is not supported in this MP4 path. No AAC conversion or channel downmix was performed; choose a compatible original audio track.", audio.codec)}))).into_response();
+        }
+    }
+    if native && subtitle_track >= 0 && device.kind != "cast" {
+        return (StatusCode::UNSUPPORTED_MEDIA_TYPE, Json(json!({"error":"Separate subtitles are currently supported for Google Cast only. Refusing to silently omit selected subtitles."}))).into_response();
+    }
+    let render_subtitle = if native { -1 } else { subtitle_track };
+    let cache_key = preparation_key(&item.path, quality, if native { "original-copy" } else { &settings.encoder }, audio_track, render_subtitle, if native { 1.0 } else { settings.subtitle_scale });
+    let direct_ok = native && native_video_ok && is_mp4 && audio_track < 0;
+    let native_subtitle = if native && subtitle_track >= 0 {
+        match ensure_vtt(&item, subtitle_track).await {
+            Ok(_) => {
+                let track = &mi.sub_tracks[subtitle_track as usize];
+                Some(json!({"trackId":1,"type":"TEXT","subtype":"SUBTITLES", "trackContentId":format!("http://{}:{}/subtitles/{}/{}",st.lan_ip,st.port,item.id,subtitle_track), "trackContentType":"text/vtt", "name":track.title, "language":track.lang.to_lowercase()}))
+            }
+            Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":error}))).into_response(),
+        }
+    } else { None };
 
     let (url, mode, quality_label) = if direct_ok {
         (
             format!("http://{}:{}/media/{}", st.lan_ip, st.port, item.id),
-            "direct play (no transcode)".to_string(),
-            "passthrough".to_string(),
+            if native_subtitle.is_some() { "original video + original audio + separate subtitles (direct)".to_string() } else { "original video + original audio (direct)".to_string() },
+            "original".to_string(),
         )
     } else {
         // Everything else is prepared once into a faststart MP4: the Cast
@@ -476,12 +508,13 @@ async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> 
                 &item.id,
                 &cache_key,
                 &item.path,
-                mi.passthrough_ok,
+                &mi.vcodec,
+                native_video_ok,
                 quality,
                 &settings.encoder,
                 mi.duration,
                 audio_track,
-                subtitle_track,
+                render_subtitle,
                 settings.subtitle_scale,
             );
             return Json(json!({
@@ -492,7 +525,9 @@ async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> 
             }))
             .into_response();
         }
-        let mode = if subtitle_track >= 0 {
+        let mode = if native {
+            if subtitle_track >= 0 { "original video + original audio + separate subtitles".to_string() } else { "original video + original audio (remux)".to_string() }
+        } else if subtitle_track >= 0 {
             "prepared with burned-in subtitles".to_string()
         } else { match quality {
             Quality::Passthrough => "remux (copy)".to_string(),
@@ -551,7 +586,7 @@ async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> 
             )
                 .into_response();
         }
-        if !crate::cast::load(&client, &url, &item.title, false) {
+        if !crate::cast::load(&client, &url, &item.title, false, native_subtitle.clone(), settings.subtitle_scale) {
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({"error":"cast channel closed", "url": url})),
@@ -611,9 +646,52 @@ async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> 
 
     Json(json!({
         "ok": true, "message": msg, "url": url, "mode": mode, "quality": quality_label,
-        "device": device.name,
+        "device": device.name, "native_subtitles": native_subtitle.is_some(),
     }))
     .into_response()
+}
+
+async fn ensure_vtt(item: &crate::library::Item, track: i32) -> Result<PathBuf, String> {
+    let key = preparation_key(&item.path, Quality::Passthrough, "webvtt-v1", -1, track, 1.0);
+    let target = prepared_dir().join(format!("{key}.vtt"));
+    if target.exists() { return Ok(target) }
+    static VTT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nonce = VTT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temporary = prepared_dir().join(format!("{key}-{}-{nonce}.part.vtt", std::process::id()));
+    let result = tokio::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i"])
+        .arg(&item.path).args(["-map", &format!("0:s:{track}"), "-c:s", "webvtt", "-f", "webvtt"])
+        .arg(&temporary).output().await.map_err(|e| e.to_string())?;
+    if !result.status.success() {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(String::from_utf8_lossy(&result.stderr).chars().take(1500).collect());
+    }
+    if let Err(e) = tokio::fs::rename(&temporary, &target).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        if !target.exists() { return Err(e.to_string()) }
+    }
+    Ok(target)
+}
+
+async fn subtitle_vtt(State(st): State<Arc<AppState>>, Path((id, track)): Path<(String, i32)>) -> Response {
+    let Some(item) = st.find_item(&id) else { return StatusCode::NOT_FOUND.into_response() };
+    let path = item.path.clone();
+    let info = tokio::task::spawn_blocking(move || probe::probe(&path)).await.unwrap_or_default();
+    if track < 0 || info.sub_tracks.get(track as usize).map(|t| !t.burnable).unwrap_or(true) { return StatusCode::NOT_FOUND.into_response() }
+    match ensure_vtt(&item, track).await {
+        Ok(path) => match tokio::fs::read(path).await {
+            Ok(bytes) => {
+                st.subtitle_fetches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                ([(header::CONTENT_TYPE, "text/vtt; charset=utf-8"), (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"), (header::CACHE_CONTROL, "no-cache")], bytes).into_response()
+            }
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        },
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    }
+}
+
+async fn subtitle_debug(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(json!({"fetches":st.subtitle_fetches.load(std::sync::atomic::Ordering::Relaxed)}))
 }
 
 fn prepared_dir() -> PathBuf {
@@ -627,7 +705,7 @@ fn prepared_dir() -> PathBuf {
 fn preparation_key(path: &str, quality: Quality, encoder: &str, audio: i32, sub: i32, scale: f64) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    "prepared-v3-subtitles".hash(&mut h);
+    "prepared-v4-original-native-subs".hash(&mut h);
     path.hash(&mut h);
     if let Ok(m) = std::fs::metadata(path) {
         m.len().hash(&mut h);
@@ -652,6 +730,7 @@ fn start_prepare(
     item_id: &str,
     cache_key: &str,
     path: &str,
+    vcodec: &str,
     passthrough_ok: bool,
     quality: Quality,
     encoder: &str,
@@ -685,6 +764,7 @@ fn start_prepare(
     let item_id = item_id.to_string();
     let cache_key = cache_key.to_string();
     let path = path.to_string();
+    let vcodec = vcodec.to_string();
     let encoder = encoder.to_string();
     tokio::spawn(async move {
         let out = prepared_path(&cache_key);
@@ -700,7 +780,7 @@ fn start_prepare(
         }
         // Clearest picture = no generation loss: when the source video is already
         // TV-decodable and nothing must be burned in, copy it bit-for-bit.
-        let mode = if passthrough_ok && sub_track < 0 && quality != Quality::V720 {
+        let mode = if passthrough_ok && sub_track < 0 && quality == Quality::Passthrough {
             crate::transcode::Mode::Passthrough
         } else {
             st2.transcoder.pick_mode(if sub_track >= 0 && quality == Quality::Passthrough { Quality::V1080Hq } else { quality }, passthrough_ok && sub_track < 0, &encoder)
@@ -739,35 +819,26 @@ fn start_prepare(
         match mode {
             crate::transcode::Mode::Passthrough => {
                 cmd.args(["-c:v", "copy"]);
+                if vcodec == "hevc" { cmd.args(["-tag:v", "hvc1"]); }
             }
             crate::transcode::Mode::Nvenc => {
                 cmd.args(["-c:v", "h264_nvenc", "-preset", "p7", "-tune", "hq", "-rc", "vbr", "-multipass", "fullres",
-                          "-cq", "15", "-b:v", "0", "-maxrate", "40M", "-bufsize", "80M",
+                          "-cq", "10", "-b:v", "0", "-maxrate", "40M", "-bufsize", "80M",
                           "-spatial-aq", "1", "-temporal-aq", "1", "-rc-lookahead", "32",
                           "-profile:v", "high", "-pix_fmt", "yuv420p", "-g", "48", "-vf", &vf]);
             }
             crate::transcode::Mode::X264 => {
-                cmd.args(["-c:v", "libx264", "-preset", "slow", "-crf", "16",
+                cmd.args(["-c:v", "libx264", "-preset", "slow", "-crf", "12",
                           "-maxrate", "40M", "-bufsize", "80M", "-pix_fmt", "yuv420p",
                           "-g", "48", "-vf", &vf]);
             }
             _ => {
-                cmd.args(["-c:v", "h264_nvenc", "-preset", "p7", "-cq", "15", "-pix_fmt", "yuv420p", "-vf", &vf]);
+                cmd.args(["-c:v", "h264_nvenc", "-preset", "p7", "-cq", "10", "-pix_fmt", "yuv420p", "-vf", &vf]);
             }
         }
-        // Audio: bit-exact copy for AAC/AC3/E-AC3 (mp4-safe, TV decodes natively);
-        // otherwise high-bitrate AAC keeping the original channel layout (no downmix).
-        let (acodec, ach) = {
-            let mi = crate::probe::probe(&path);
-            let idx = if audio_n >= 0 { audio_n as usize } else { 0 };
-            mi.audio_tracks.get(idx).map(|t| (t.codec.clone(), t.channels)).unwrap_or_default()
-        };
-        if matches!(acodec.as_str(), "aac" | "ac3" | "eac3") {
-            cmd.args(["-c:a", "copy"]);
-        } else {
-            let ch = ach.clamp(1, 6);
-            cmd.args(["-c:a", "aac", "-b:a", &format!("{}k", (96 * ch.max(2)).min(640)), "-ac", &ch.to_string()]);
-        }
+        // No audio re-encoding/downmix. Compatibility was checked before
+        // preparation; avoid probing the whole source again in the hot path.
+        cmd.args(["-c:a", "copy", "-map_metadata", "0", "-map_chapters", "0"]);
         cmd.args(["-sn"])
             .args(["-movflags", "+faststart", "-f", "mp4"])
             .arg(&tmp)

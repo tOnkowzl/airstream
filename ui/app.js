@@ -152,14 +152,21 @@ function select(id) {
 
 /* ------------------------ track pickers (from real streams) ------------------------ */
 let tracksFor = '';
-async function loadTracks(id) {
-  if (!id || tracksFor === id) return;
+let trackRequest = null;
+function loadTracks(id) {
+  if (!id) return Promise.resolve();
+  if (tracksFor === id) return trackRequest || Promise.resolve();
   tracksFor = id;
+  trackRequest = populateTracks(id);
+  return trackRequest;
+}
+async function populateTracks(id) {
   const a = $('#selAudio'), s = $('#selSubs');
   a.innerHTML = '<option value="-1">กำลังอ่านไฟล์…</option>';
   s.innerHTML = '<option value="-1">กำลังอ่านไฟล์…</option>';
   try {
     const t = await api('/api/item/' + id + '/tracks');
+    if (tracksFor !== id) return;
     a.innerHTML = '';
     a.appendChild(new Option('อัตโนมัติ (ค่าเริ่มต้นของไฟล์)', '-1'));
     (t.audio || []).forEach((tr) => {
@@ -183,13 +190,15 @@ async function loadTracks(id) {
     // auto-pick preferred language when nothing explicit is chosen
     if (st.audio_track === -1 && st.audioLanguages) {
       const pref = st.audioLanguages.toUpperCase();
-      const hit = (t.audio || []).find((tr) => (tr.lang || '').toUpperCase() === pref);
+      const lang = {THA:'TH',ENG:'EN',JPN:'JP',KOR:'KO'};
+      const hit = (t.audio || []).find((tr) => (lang[(tr.lang || '').toUpperCase()] || (tr.lang || '').toUpperCase()) === pref);
       if (hit) a.value = String(hit.n);
     }
     if (st.subtitle_track === -1 && (st.subtitleLanguages || '').startsWith('TH')) {
-      const hit = (t.subtitles || []).find((tr) => (tr.lang || '').toUpperCase() === 'TH' && tr.burnable);
+      const hit = (t.subtitles || []).find((tr) => ['TH','THA'].includes((tr.lang || '').toUpperCase()) && tr.burnable);
       if (hit) s.value = String(hit.n);
     }
+    $('#sSubRender').checked = parseInt(s.value, 10) >= 0;
   } catch (e) {
     a.innerHTML = '<option value="-1">อ่านไฟล์ไม่สำเร็จ</option>';
     s.innerHTML = '<option value="-1">ปิด</option>';
@@ -273,6 +282,11 @@ async function castItem(id) {
   const it = items.find((x) => x.id === id);
   toast(`กำลังส่ง ${it ? it.title : ''} …`, 4000);
   try {
+    await loadTracks(id);
+    clearTimeout(saveTimer);
+    const settings = {...readSettings(), last_item: id};
+    await post('/api/settings', settings);
+    STATE.prefs.settings = settings;
     const r = await post('/api/cast', { device: deviceId, id });
     if (r.preparing) {
       $('#npTitle').textContent = it ? it.title : '';

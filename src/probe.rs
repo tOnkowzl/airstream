@@ -28,6 +28,10 @@ pub struct FfStream {
     pub disposition: Option<serde_json::Value>,
     #[serde(default)]
     pub profile: String,
+    #[serde(default)]
+    pub color_transfer: String,
+    #[serde(default)]
+    pub side_data_list: Vec<serde_json::Value>,
 }
 
 impl FfStream {
@@ -99,6 +103,8 @@ pub struct MediaInfo {
     pub profile: String,
     pub pix_fmt: String,
     pub bit_depth: u32,
+    pub hdr: bool,
+    pub color_transfer: String,
     pub acodec: String,
     pub channels: u32,
     pub audio_streams: usize,
@@ -144,6 +150,8 @@ pub fn probe(path: &str) -> MediaInfo {
                 mi.height = s.height;
                 mi.pix_fmt = s.pix_fmt.clone();
                 mi.profile = s.profile.clone();
+                mi.color_transfer = s.color_transfer.clone();
+                mi.hdr = matches!(s.color_transfer.as_str(), "smpte2084" | "arib-std-b67") || s.side_data_list.iter().any(|v| v.to_string().contains("DOVI"));
             }
             "audio" => {
                 mi.audio_streams += 1;
