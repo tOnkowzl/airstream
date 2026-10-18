@@ -168,6 +168,9 @@ impl Library {
         let path = dir.join("PlaylistManager.prefs");
 
         let mut prefs = read_prefs(&path).unwrap_or_default();
+        if ![1.0, 1.25, 1.5, 1.75, 2.0].contains(&prefs.settings.playback_rate) {
+            prefs.settings.playback_rate = 1.0;
+        }
         if prefs.playlists.is_empty() {
             prefs.playlists.push(Playlist {
                 name: "Playlist".into(),

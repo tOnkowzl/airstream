@@ -25,6 +25,18 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
+    // Installed builds carry private media tools. Use them without changing
+    // the user's global PATH, including when launched from the Start Menu.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            if dir.join("ffmpeg.exe").exists() && dir.join("ffprobe.exe").exists() {
+                let old = std::env::var_os("PATH").unwrap_or_default();
+                if let Ok(path) = std::env::join_paths(std::iter::once(dir.to_path_buf()).chain(std::env::split_paths(&old))) {
+                    std::env::set_var("PATH", path);
+                }
+            }
+        }
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "airstream=info".into()),
