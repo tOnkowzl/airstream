@@ -291,6 +291,50 @@ impl Library {
         (added, skipped)
     }
 
+    /// Removes many items at once (playlist entries only, never media files).
+    pub fn remove_items(&self, ids: &[String]) -> usize {
+        let mut removed = 0usize;
+        {
+            let mut prefs = self.prefs.lock().unwrap();
+            for playlist in prefs.playlists.iter_mut() {
+                let before = playlist.items.len();
+                playlist.items.retain(|i| !ids.contains(&i.id));
+                removed += before - playlist.items.len();
+            }
+        }
+        if removed > 0 {
+            self.save();
+        }
+        removed
+    }
+
+    /// Moves a block of items, keeping their current relative order, before
+    /// `before` (or to the end). False if ids are stale or the target is part
+    /// of the moved block.
+    pub fn move_items(&self, ids: &[String], before: Option<&str>) -> bool {
+        let mut prefs = self.prefs.lock().unwrap();
+        let items = &mut prefs.playlists[0].items;
+        if ids.is_empty() || ids.iter().any(|id| !items.iter().any(|i| &i.id == id)) {
+            return false;
+        }
+        if let Some(target) = before {
+            if ids.iter().any(|id| id == target) || !items.iter().any(|i| i.id == target) {
+                return false;
+            }
+        }
+        let mut block = Vec::new();
+        let mut rest = Vec::new();
+        for item in items.drain(..) {
+            if ids.contains(&item.id) { block.push(item) } else { rest.push(item) }
+        }
+        let at = before.and_then(|b| rest.iter().position(|i| i.id == b)).unwrap_or(rest.len());
+        rest.splice(at..at, block);
+        *items = rest;
+        drop(prefs);
+        self.save();
+        true
+    }
+
     /// Moves one item before another (or to the end when `before` is None).
     /// Returns false for stale ids so the UI can refresh instead of guessing.
     pub fn move_item(&self, id: &str, before: Option<&str>) -> bool {

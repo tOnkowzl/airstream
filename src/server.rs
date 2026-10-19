@@ -199,6 +199,7 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error
         .route("/api/add", post(api_add))
         .route("/api/add_dropped", post(api_add_dropped))
         .route("/api/playlist/move", post(api_playlist_move))
+        .route("/api/playlist/remove", post(api_playlist_remove))
         .route("/api/pick_folder", post(api_pick_folder))
         .route("/api/pick_files", post(api_pick_files))
         .route("/api/open_prefs", post(api_open_prefs))
@@ -367,13 +368,34 @@ async fn api_add_dropped(
 
 #[derive(Deserialize)]
 struct MoveReq {
+    #[serde(default)]
     id: String,
+    #[serde(default)]
+    ids: Vec<String>,
     #[serde(default)]
     before: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct RemoveManyReq {
+    ids: Vec<String>,
+}
+
+async fn api_playlist_remove(State(st): State<Arc<AppState>>, Json(req): Json<RemoveManyReq>) -> Response {
+    if req.ids.is_empty() || req.ids.len() > 5000 {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "ไม่มีรายการที่เลือก"}))).into_response();
+    }
+    let removed = st.library.remove_items(&req.ids);
+    Json(json!({"ok": true, "removed": removed})).into_response()
+}
+
 async fn api_playlist_move(State(st): State<Arc<AppState>>, Json(req): Json<MoveReq>) -> Response {
-    if st.library.move_item(&req.id, req.before.as_deref()) {
+    let ok = if req.ids.is_empty() {
+        st.library.move_item(&req.id, req.before.as_deref())
+    } else {
+        st.library.move_items(&req.ids, req.before.as_deref())
+    };
+    if ok {
         Json(json!({"ok": true})).into_response()
     } else {
         (StatusCode::CONFLICT, Json(json!({"error": "รายการเปลี่ยนไปแล้ว กำลังรีเฟรช"}))).into_response()

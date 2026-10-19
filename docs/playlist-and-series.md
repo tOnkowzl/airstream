@@ -29,3 +29,11 @@ Release-executable E2E, using Edge and a real Cast TV:
 - A real 4K HEVC 10-bit HDR10 60fps excerpt from the supplied series played on the tested receiver in Original mode.
 
 If Airflow (`Airflow.server.exe`) already owns port 42015, Airstream moves to the next free port, normally 42016.
+
+## Multi-select and right-click menu (v0.1.10)
+
+- Click selects one row. Ctrl/Cmd+click toggles a row. Shift+click selects the range from the last anchor row. Ctrl+A selects all; Esc returns to one row.
+- Delete, the row ✕ (when the row is part of the selection) and the "ลบที่เลือก (n)" button remove all selected entries in one call (`/api/playlist/remove`). Files stay on disk.
+- Dragging any selected row moves the whole selection, keeping its order (`/api/playlist/move` with `ids`).
+- Right-click opens a menu: Cast, move to top/bottom, select all, clear selection, remove. Shift+right-click extends the range first. Right-clicking an unselected row selects just that row; right-clicking inside the selection keeps it. Arrow keys navigate the menu and Esc closes it.
+- A new Cast LOAD clears the previous media session's subtitle/track state, including during back-to-back casts.

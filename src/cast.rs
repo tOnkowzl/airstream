@@ -428,8 +428,11 @@ pub fn load(client: &CastClient, url: &str, title: &str, hls: bool, subtitle: Op
     {
         let mut status = client.status.lock().unwrap();
         status.last_error.clear();
-        status.stale_session_id = status.media_session_id;
+        // Back-to-back LOADs: keep the older replaced session blocked too.
+        if status.media_session_id != 0 { status.stale_session_id = status.media_session_id; }
         status.media_session_id = 0;
+        status.active_track_ids.clear();
+        status.media_tracks.clear();
         status.player_state = "LOADING".into();
         status.current_time = 0.0;
         status.playback_rate = 1.0;

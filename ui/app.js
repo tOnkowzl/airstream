@@ -5,12 +5,16 @@ const el = (t, c, txt) => { const n = document.createElement(t); if (c) n.classN
 let STATE = null;
 let items = [];
 let selected = null;
+// Multi-selection: `selected` is the primary item (shown in the track pickers).
+let multi = new Set();
+let anchorId = null;
 let deviceId = '';
 let position = { elapsed: 0, duration: 0, state: 'IDLE' };
 let probeQueue = [], probing = 0;
 let nowHls = false;
 let playlistRendered = false;
 let dragId = null;
+let dragIds = [];
 // Remembered track choices (sent to the server, applied to every new episode).
 let audioPref = null, subtitlePref = null, subtitleOff = false;
 let loadedTracks = { audio: [], subtitles: [] };
@@ -122,6 +126,8 @@ function scheduleSave() {
 function render() {
   const pl = (STATE.prefs.playlists && STATE.prefs.playlists[0]) || { name: 'Playlist', items: [] };
   items = pl.items || [];
+  multi = new Set(Array.from(multi).filter((id) => items.some((x) => x.id === id)));
+  if (selected && !items.some((x) => x.id === selected)) selected = multi.size ? Array.from(multi).pop() : null;
   $('#plName').textContent = pl.name || 'Playlist';
   $('#plCount').textContent = String(items.length);
   $('#footInfo').textContent = `${items.length} รายการ · ดับเบิลคลิกเพื่อ cast`;
@@ -140,7 +146,7 @@ function render() {
     const row = el('div', 'row');
     row.dataset.id = it.id;
     row.draggable = true;
-    if (it.id === selected) row.classList.add('sel');
+    if (it.id === selected || multi.has(it.id)) row.classList.add('sel');
     if (STATE.now && STATE.now.item_id === it.id) row.classList.add('playing');
     const grip = el('div', 'grip', '⋮⋮');
     grip.title = 'ลากเพื่อสลับตำแหน่ง';
@@ -157,28 +163,73 @@ function render() {
     del.type = 'button';
     del.title = 'เอาออกจาก Playlist (ไม่ลบไฟล์จริง)';
     del.setAttribute('aria-label', `เอา ${title} ออกจาก Playlist`);
-    del.onclick = (ev) => { ev.stopPropagation(); removeItem(it.id); };
+    del.onclick = (ev) => { ev.stopPropagation(); removeItems(multi.has(it.id) && multi.size > 1 ? Array.from(multi) : [it.id]); };
     del.ondblclick = (ev) => ev.stopPropagation();
     row.appendChild(del);
-    row.onclick = () => select(it.id);
+    row.onclick = (ev) => clickRow(ev, it.id);
     row.ondblclick = () => castItem(it.id);
     row.addEventListener('dragstart', (ev) => {
       dragId = it.id;
+      dragIds = multi.has(it.id) && multi.size > 1 ? items.filter((x) => multi.has(x.id)).map((x) => x.id) : [it.id];
       ev.dataTransfer.effectAllowed = 'move';
       ev.dataTransfer.setData(ITEM_MIME, it.id);
       ev.dataTransfer.setData('text/plain', title);
       requestAnimationFrame(() => row.classList.add('dragging'));
     });
-    row.addEventListener('dragend', () => { dragId = null; row.classList.remove('dragging'); clearDropMarks(); });
+    row.addEventListener('dragend', () => { dragId = null; dragIds = []; row.classList.remove('dragging'); clearDropMarks(); });
     rows.appendChild(row);
     if (!it.duration) probeQueue.push(it.id);
   }
+  paintSelection();
   pumpProbes();
+}
+
+function showSelectedTitle() {
+  const it = items.find((x) => x.id === selected);
+  if (it && !(STATE.now && STATE.now.item_id)) $('#npTitle').textContent = it.title || it.path;
+}
+function paintSelection() {
+  showSelectedTitle();
+  document.querySelectorAll('.row').forEach((r) => r.classList.toggle('sel', multi.has(r.dataset.id)));
+  const button = $('#btnRemoveSel');
+  button.classList.toggle('hidden', multi.size < 2);
+  button.textContent = `ลบที่เลือก (${multi.size})`;
+  if (multi.size > 1) $('#footInfo').textContent = `เลือก ${multi.size} จาก ${items.length} รายการ · Delete เพื่อเอาออก · Esc ยกเลิก`;
+  else $('#footInfo').textContent = `${items.length} รายการ · ดับเบิลคลิกเพื่อ cast`;
+}
+
+// Click: plain = one, Ctrl/Cmd = toggle, Shift = range from the anchor row.
+function clickRow(ev, id) {
+  if (ev.shiftKey && anchorId && items.some((x) => x.id === anchorId)) {
+    const a = items.findIndex((x) => x.id === anchorId);
+    const b = items.findIndex((x) => x.id === id);
+    const [from, to] = a < b ? [a, b] : [b, a];
+    multi = new Set(items.slice(from, to + 1).map((x) => x.id));
+    selected = id;
+    paintSelection();
+    return;
+  }
+  if (ev.ctrlKey || ev.metaKey) {
+    if (multi.has(id)) {
+      multi.delete(id);
+      if (selected === id) selected = multi.size ? Array.from(multi).pop() : null;
+    } else {
+      multi.add(id);
+      selected = id;
+    }
+    anchorId = id;
+    paintSelection();
+    if (selected) loadTracks(selected);
+    return;
+  }
+  select(id);
 }
 
 function select(id) {
   selected = id;
-  document.querySelectorAll('.row').forEach((r) => r.classList.toggle('sel', r.dataset.id === id));
+  multi = new Set([id]);
+  anchorId = id;
+  paintSelection();
   const it = items.find((x) => x.id === id);
   if (it && !(STATE.now && STATE.now.item_id)) {
     $('#npTitle').textContent = it.title || it.path;
@@ -538,19 +589,31 @@ async function refreshPlaylist() {
   render();
 }
 
-async function removeItem(id) {
-  const index = items.findIndex((x) => x.id === id);
-  if (index < 0) return;
-  const removed = items[index];
-  const title = removed.title || removed.path;
+async function removeItems(ids) {
+  const wanted = ids.filter((id) => items.some((x) => x.id === id));
+  if (!wanted.length) return;
+  const firstIndex = Math.min(...wanted.map((id) => items.findIndex((x) => x.id === id)));
+  const names = wanted.map((id) => { const it = items.find((x) => x.id === id); return it.title || it.path; });
+  const playing = STATE.now && wanted.includes(STATE.now.item_id);
   try {
-    await api('/api/item/' + encodeURIComponent(id), { method: 'DELETE' });
-    if (selected === id) { selected = null; tracksFor = ''; }
+    if (wanted.length === 1) await api('/api/item/' + encodeURIComponent(wanted[0]), { method: 'DELETE' });
+    else await post('/api/playlist/remove', { ids: wanted });
+    if (selected && wanted.includes(selected)) { selected = null; tracksFor = ''; }
+    wanted.forEach((id) => multi.delete(id));
     await refreshPlaylist();
-    if (!selected && items.length) select(items[Math.min(index, items.length - 1)].id);
-    const playing = STATE.now && STATE.now.item_id === id;
-    toast(`เอาออกแล้ว: ${title}${playing ? ' (ทีวียังเล่นอยู่ กด หยุด เพื่อหยุด)' : ''} · ไฟล์จริงยังอยู่`, 4200);
+    if (!selected && items.length) select(items[Math.min(firstIndex, items.length - 1)].id);
+    const what = wanted.length === 1 ? names[0] : `${wanted.length} รายการ`;
+    toast(`เอาออกแล้ว: ${what}${playing ? ' (ทีวียังเล่นอยู่ กด หยุด เพื่อหยุด)' : ''} · ไฟล์จริงยังอยู่`, 4200);
   } catch (e) { toast('เอาออกไม่สำเร็จ: ' + e.message, 5000); }
+}
+const removeItem = (id) => removeItems([id]);
+$('#btnRemoveSel').onclick = () => removeItems(Array.from(multi));
+
+async function moveItems(ids, beforeId) {
+  try {
+    await post('/api/playlist/move', { ids, before: beforeId || null });
+  } catch (e) { toast(e.message, 3500); }
+  await refreshPlaylist();
 }
 
 async function moveItem(id, beforeId) {
@@ -571,7 +634,7 @@ function clearDropMarks() {
 }
 function dropTarget(clientY) {
   for (const row of document.querySelectorAll('#rows .row')) {
-    if (row.dataset.id === dragId) continue;
+    if (row.dataset.id === dragId || dragIds.includes(row.dataset.id)) continue;
     const box = row.getBoundingClientRect();
     if (clientY < box.top + box.height / 2) return { before: row.dataset.id, row };
   }
@@ -658,7 +721,8 @@ document.addEventListener('drop', (e) => {
   clearDropMarks();
   if (internal) {
     const id = e.dataTransfer.getData(ITEM_MIME) || dragId;
-    if (id && overList(e)) moveItem(id, target.before);
+    const ids = dragIds.length ? dragIds.slice() : (id ? [id] : []);
+    if (ids.length && overList(e)) moveItems(ids, target.before);
     return;
   }
   // DataTransfer objects expire after this handler returns: read them now.
@@ -672,8 +736,10 @@ document.addEventListener('drop', (e) => {
 
 document.addEventListener('keydown', (e) => {
   const tag = (e.target.tagName || '').toLowerCase();
-  if (['input', 'select', 'textarea'].includes(tag) || !selected) return;
-  if (e.key === 'Delete') { e.preventDefault(); removeItem(selected); return; }
+  if (['input', 'select', 'textarea'].includes(tag) || (!selected && !multi.size)) return;
+  if (e.key === 'Delete') { e.preventDefault(); removeItems(multi.size ? Array.from(multi) : [selected]); return; }
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') { e.preventDefault(); multi = new Set(items.map((x) => x.id)); paintSelection(); return; }
+  if (e.key === 'Escape' && multi.size > 1) { select(selected); return; }
   if (e.altKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
     e.preventDefault();
     const i = items.findIndex((x) => x.id === selected);
@@ -716,3 +782,81 @@ $('#selSubs').addEventListener('change', () => { rememberSubtitle(); showTrackHi
 $('#sSubRender').addEventListener('change', () => {
   if (!$('#sSubRender').checked) { $('#selSubs').value = '-1'; rememberSubtitle(); scheduleSave(); }
 });
+
+
+/* ------------------ right-click menu (Shift+right-click extends the selection) ------------------ */
+const ctxMenu = document.createElement('div');
+ctxMenu.className = 'ctxmenu hidden';
+ctxMenu.setAttribute('role', 'menu');
+document.body.appendChild(ctxMenu);
+
+function closeCtx() { ctxMenu.classList.add('hidden'); ctxMenu.innerHTML = ''; }
+
+function ctxItem(label, hint, onPick, opts = {}) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.setAttribute('role', 'menuitem');
+  if (opts.danger) button.classList.add('danger');
+  button.disabled = !!opts.disabled;
+  const text = document.createElement('span'); text.textContent = label;
+  button.appendChild(text);
+  if (hint) { const k = document.createElement('kbd'); k.textContent = hint; button.appendChild(k); }
+  button.onclick = () => { closeCtx(); onPick(); };
+  return button;
+}
+
+async function moveSelection(toTop) {
+  const ids = items.filter((x) => multi.has(x.id)).map((x) => x.id);
+  if (!ids.length) return;
+  if (toTop) { await moveItems(ids, items.find((x) => !multi.has(x.id))?.id || null); }
+  else await moveItems(ids, null);
+}
+
+function openCtx(ev, rowId) {
+  const chosen = items.length && rowId;
+  if (chosen) {
+    if (ev.shiftKey) clickRow({ shiftKey: true }, rowId);
+    else if (ev.ctrlKey || ev.metaKey) { if (!multi.has(rowId)) clickRow({ ctrlKey: true }, rowId); }
+    else if (!multi.has(rowId)) select(rowId);
+  }
+  const ids = Array.from(multi);
+  const many = ids.length > 1;
+  ctxMenu.innerHTML = '';
+  const head = document.createElement('div'); head.className = 'ctxhead';
+  head.textContent = many ? `เลือกอยู่ ${ids.length} รายการ` : (items.find((x) => x.id === selected)?.title || 'Playlist');
+  ctxMenu.appendChild(head);
+  ctxMenu.appendChild(ctxItem('Cast ไปทีวี', 'ดับเบิลคลิก', () => selected && castItem(selected), { disabled: many || !selected }));
+  ctxMenu.appendChild(ctxItem(many ? 'เลื่อนไปบนสุด' : 'เลื่อนไปบนสุด', '', () => moveSelection(true), { disabled: !ids.length }));
+  ctxMenu.appendChild(ctxItem('เลื่อนไปล่างสุด', '', () => moveSelection(false), { disabled: !ids.length }));
+  ctxMenu.appendChild(document.createElement('hr'));
+  ctxMenu.appendChild(ctxItem('เลือกทั้งหมด', 'Ctrl+A', () => { multi = new Set(items.map((x) => x.id)); paintSelection(); }, { disabled: !items.length }));
+  ctxMenu.appendChild(ctxItem('ยกเลิกการเลือก', 'Esc', () => { if (selected) select(selected); }, { disabled: !many }));
+  ctxMenu.appendChild(document.createElement('hr'));
+  ctxMenu.appendChild(ctxItem(many ? `เอาออกจาก Playlist (${ids.length})` : 'เอาออกจาก Playlist', 'Delete', () => removeItems(ids), { danger: true, disabled: !ids.length }));
+  ctxMenu.classList.remove('hidden');
+  const box = ctxMenu.getBoundingClientRect();
+  ctxMenu.style.left = Math.max(6, Math.min(ev.clientX, window.innerWidth - box.width - 6)) + 'px';
+  ctxMenu.style.top = Math.max(6, Math.min(ev.clientY, window.innerHeight - box.height - 6)) + 'px';
+  const first = ctxMenu.querySelector('button:not(:disabled)');
+  if (first) first.focus({ preventScroll: true });
+}
+
+document.addEventListener('contextmenu', (ev) => {
+  const row = ev.target.closest && ev.target.closest('#rows .row');
+  const inList = ev.target.closest && ev.target.closest('#rows');
+  if (!row && !inList) { closeCtx(); return; }
+  ev.preventDefault();
+  openCtx(ev, row ? row.dataset.id : null);
+});
+document.addEventListener('mousedown', (ev) => { if (!ctxMenu.contains(ev.target)) closeCtx(); });
+window.addEventListener('blur', closeCtx);
+window.addEventListener('resize', closeCtx);
+document.addEventListener('scroll', closeCtx, true);
+document.addEventListener('keydown', (ev) => {
+  if (ctxMenu.classList.contains('hidden')) return;
+  const buttons = Array.from(ctxMenu.querySelectorAll('button:not(:disabled)'));
+  const at = buttons.indexOf(document.activeElement);
+  if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); closeCtx(); }
+  else if (ev.key === 'ArrowDown' && buttons.length) { ev.preventDefault(); buttons[(at + 1) % buttons.length].focus(); }
+  else if (ev.key === 'ArrowUp' && buttons.length) { ev.preventDefault(); buttons[(at - 1 + buttons.length) % buttons.length].focus(); }
+}, true);
