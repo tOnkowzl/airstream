@@ -427,8 +427,18 @@ async function transport(action) {
   try { await post('/api/transport', { action }); setTimeout(pollPosition, 500); }
   catch (e) { toast('คำสั่งไม่สำเร็จ: ' + e.message); }
 }
-$('#btnPlayPause').onclick = () => transport(position.state === 'PLAYING' ? 'pause' : 'play');
-$('#btnStop').onclick = () => transport('stop');
+// Play with a live TV session = pause/resume. Otherwise (just reopened the app, finished,
+// stopped, TV app closed) start the selected item; saved resume position applies.
+const LIVE_STATES = ['PLAYING', 'PAUSED', 'BUFFERING', 'TRANSITIONING'];
+$('#btnPlayPause').onclick = () => {
+  const live = position.via === 'cast' && LIVE_STATES.includes((position.state || '').toUpperCase());
+  if (live) return transport(position.state === 'PLAYING' ? 'pause' : 'play');
+  const target = selected || (STATE.now && STATE.now.item_id) || (items[0] && items[0].id);
+  if (!target) { toast('เลือกหนังก่อน'); return; }
+  if (!selected) select(target);
+  castItem(target);
+};
+$('#btnStop').onclick = () => { if (position.via === 'cast' && LIVE_STATES.includes((position.state || '').toUpperCase())) transport('stop'); else toast('ไม่มีอะไรกำลังเล่นบนทีวี'); };
 
 async function seekTo(sec) {
   try { await post('/api/seek', { seconds: Math.max(0, sec) }); setTimeout(pollPosition, 700); }
