@@ -22,6 +22,7 @@ mod process;
 mod server;
 mod stream;
 mod transcode;
+mod window_lifetime;
 
 use std::sync::Arc;
 
@@ -39,11 +40,8 @@ async fn main() {
             }
         }
     }
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "airstream=info".into()),
-        )
-        .init();
+    init_logging();
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), pid = std::process::id(), "application launched");
 
     // Single instance: if Airstream is already running, just show its window.
     if let Some(port) = running_instance().await {
@@ -58,7 +56,7 @@ async fn main() {
     let url = format!("http://127.0.0.1:{}/", port);
 
     let st = state.clone();
-    tokio::spawn(async move {
+    let server_task = tokio::spawn(async move {
         if let Err(e) = server::serve(st).await {
             tracing::error!("server stopped: {e}");
         }
@@ -73,21 +71,42 @@ async fn main() {
     }
     open_window(&url);
 
-    // One app, one lifetime: the UI pings every few seconds; when the window
-    // is closed the pings stop and the whole process (server included) exits.
-    let started = server::now_secs();
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        let last = server::LAST_PING.load(std::sync::atomic::Ordering::Relaxed);
-        let now = server::now_secs();
-        let idle = if last == 0 { now.saturating_sub(started) } else { now.saturating_sub(last) };
-        let limit = if last == 0 { 40 } else { 12 };
-        if idle > limit {
-            tracing::info!("window closed — exiting");
+    // The OS window, not browser JavaScript heartbeats, owns backend lifetime.
+    tracing::info!(port, "backend follows native app windows; renderer heartbeat is not used for shutdown");
+    tokio::select! {
+        result = server_task => {
+            if let Err(error) = result { tracing::error!(%error, "backend task failed"); }
+        }
+        _ = window_lifetime::wait_until_closed() => {
             server::save_resume_now(&state, &mut String::new());
-            std::process::exit(0);
+            tracing::info!("last app window closed; backend shutting down");
         }
     }
+
+}
+
+/// Persist diagnostics without creating a console. Rotate on startup at 8 MiB.
+fn init_logging() {
+    let directory = library::data_dir().join("logs");
+    let _ = std::fs::create_dir_all(&directory);
+    let path = directory.join("backend.log");
+    if std::fs::metadata(&path).map(|m| m.len() > 8 * 1024 * 1024).unwrap_or(false) {
+        let previous = directory.join("backend.previous.log");
+        let _ = std::fs::remove_file(&previous);
+        let _ = std::fs::rename(&path, previous);
+    }
+    let builder = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "airstream=info".into()));
+    match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        Ok(file) => builder.with_writer(std::sync::Mutex::new(file)).init(),
+        Err(_) => builder.init(),
+    }
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!(panic = %info, "application panic");
+        previous(info);
+    }));
 }
 
 /// Port of an already-running Airstream, if any (probes /api/ping).

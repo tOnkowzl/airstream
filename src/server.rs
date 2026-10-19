@@ -233,7 +233,7 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error
 const LOGO_PNG: &[u8] = include_bytes!("../ui/logo.png");
 const LOGO_SVG: &str = include_str!("../ui/logo.svg");
 
-/// UI heartbeat: the process exits once the window stops pinging.
+/// UI health probe only; missing browser pings never stop the backend.
 pub static LAST_PING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn now_secs() -> u64 {
@@ -579,6 +579,7 @@ struct CastReq {
 }
 
 async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> impl IntoResponse {
+    tracing::info!(item = %req.id, device = %req.device, prepare_only = req.prepare_only, "cast request");
     let Some(item) = st.find_item(&req.id) else {
         return (StatusCode::NOT_FOUND, Json(json!({"error":"item not found"}))).into_response();
     };
@@ -755,7 +756,7 @@ async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> 
         for _ in 0..28 {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             let s = client.status();
-            if s.player_state == "PLAYING" || s.current_time > 0.0 {
+            if s.media_session_id != 0 && s.player_state == "PLAYING" {
                 started = true;
                 break;
             }
@@ -1092,6 +1093,7 @@ struct TransportReq {
 }
 
 async fn api_transport(State(st): State<Arc<AppState>>, Json(req): Json<TransportReq>) -> impl IntoResponse {
+    tracing::info!(action = %req.action, "transport request");
     let cast_opt = { st.cast.lock().unwrap().clone() };
     if let Some(client) = cast_opt {
         let ok = match req.action.as_str() {
@@ -1476,6 +1478,14 @@ pub fn start_resume_tracker(st: Arc<AppState>) {
         let mut finished_for = String::new();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            // Keep the Cast channel and saved position fresh even with no UI.
+            let client = st.cast.lock().unwrap().clone();
+            if let Some(client) = client {
+                if client.status().connected {
+                    client.request_status();
+                    tokio::time::sleep(std::time::Duration::from_millis(180)).await;
+                }
+            }
             save_resume_now(&st, &mut finished_for);
         }
     });

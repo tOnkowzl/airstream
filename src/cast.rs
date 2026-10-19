@@ -291,7 +291,7 @@ pub async fn connect(host: &str, port: u16, device_name: &str) -> Result<CastCli
                 }
                 let body = buf[4..4 + len].to_vec();
                 buf.drain(..4 + len);
-                let (_src, _dst, joined) = decode_message(&body);
+                let (src, _dst, joined) = decode_message(&body);
                 let (ns, payload) = match joined.split_once('|') {
                     Some(v) => v,
                     None => continue,
@@ -299,6 +299,14 @@ pub async fn connect(host: &str, port: u16, device_name: &str) -> Result<CastCli
                 let Ok(v) = serde_json::from_str::<Value>(payload) else { continue };
 
                 match ns {
+                    NS_HEARTBEAT => {
+                        if v.get("type").and_then(|t| t.as_str()) == Some("PING") {
+                            // Receiver keepalive must not depend on browser polling.
+                            let _ = tx_reader.send(Cmd::Send(
+                                NS_HEARTBEAT.into(), src, json!({"type":"PONG"}),
+                            ));
+                        }
+                    }
                     NS_RECEIVER => {
                         let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
                         if ty == "RECEIVER_STATUS" {
