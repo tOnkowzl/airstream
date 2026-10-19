@@ -573,6 +573,9 @@ struct CastReq {
     /// pre-warm the next episode so there is no wait at the end of this one.
     #[serde(default)]
     prepare_only: bool,
+    /// Ignore the saved stop position and play from 0:00.
+    #[serde(default)]
+    from_start: bool,
 }
 
 async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> impl IntoResponse {
@@ -689,6 +692,12 @@ async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> 
         return Json(json!({ "ready": true, "prepared": true })).into_response();
     }
 
+    // Continue where the user stopped (not for a nearly-finished item).
+    let start_at = if settings.resume && !req.from_start && device.kind == "cast"
+        && item.resume_pos > 10.0 && (mi.duration <= 0.0 || item.resume_pos < mi.duration - 30.0) {
+        item.resume_pos
+    } else { 0.0 };
+
     let msg = if device.kind == "cast" {
         let existing = {
             let guard = st.cast.lock().unwrap();
@@ -735,7 +744,7 @@ async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> 
             )
                 .into_response();
         }
-        if !crate::cast::load(&client, &url, &item.title, false, native_subtitle.clone(), settings.subtitle_scale, settings.playback_rate) {
+        if !crate::cast::load(&client, &url, &item.title, false, native_subtitle.clone(), settings.subtitle_scale, settings.playback_rate, start_at) {
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({"error":"cast channel closed", "url": url})),
@@ -795,7 +804,7 @@ async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> 
 
     Json(json!({
         "ok": true, "message": msg, "url": url, "mode": mode, "quality": quality_label,
-        "device": device.name, "native_subtitles": native_subtitle.is_some(),
+        "device": device.name, "native_subtitles": native_subtitle.is_some(), "resumed_from": start_at,
     }))
     .into_response()
 }
@@ -1456,5 +1465,41 @@ fn mime_for(path: &std::path::Path) -> &'static str {
         "jpg" | "jpeg" => "image/jpeg",
         "mkv" => "video/x-matroska",
         _ => "application/octet-stream",
+    }
+}
+
+
+/// Saves the TV position of the playing item every few seconds so closing or
+/// crashing the app loses at most a moment of progress. Finished items reset.
+pub fn start_resume_tracker(st: Arc<AppState>) {
+    tokio::spawn(async move {
+        let mut finished_for = String::new();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            save_resume_now(&st, &mut finished_for);
+        }
+    });
+}
+
+pub fn save_resume_now(st: &Arc<AppState>, finished_for: &mut String) {
+    let Some(client) = st.cast.lock().unwrap().clone() else { return };
+    let item_id = st.now.lock().unwrap().item_id.clone();
+    if item_id.is_empty() { return }
+    let s = client.status();
+    // media_session_id is 0 right after a LOAD, so a stale position is never saved.
+    if !s.connected || s.media_session_id == 0 { return }
+    let key = format!("{item_id}:{}", s.media_session_id);
+    if s.player_state == "IDLE" {
+        if s.idle_reason == "FINISHED" && *finished_for != key {
+            *finished_for = key;
+            st.library.set_resume(&item_id, 0.0);
+        }
+        return;
+    }
+    if !matches!(s.player_state.as_str(), "PLAYING" | "PAUSED" | "BUFFERING") { return }
+    if s.duration > 0.0 && s.current_time > s.duration - 30.0 {
+        st.library.set_resume(&item_id, 0.0);
+    } else if s.current_time > 5.0 {
+        st.library.set_resume(&item_id, s.current_time);
     }
 }

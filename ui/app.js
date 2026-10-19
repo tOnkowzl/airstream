@@ -69,6 +69,8 @@ async function boot() {
     $('#devName').textContent = deviceId ? 'อุปกรณ์ที่เคยใช้' : 'เลือกอุปกรณ์';
   }
   render();
+  const lastId = s.last_item;
+  if (lastId && items.some((x) => x.id === lastId)) select(lastId);
 }
 
 function fillSettings(s) {
@@ -158,6 +160,11 @@ function render() {
     const codec = el('span', 'codec', (it.vcodec || '').toUpperCase());
     meta.appendChild(codec);
     meta.appendChild(document.createTextNode(it.duration > 0 ? fmt(it.duration) : ''));
+    if (it.resume_pos > 10 && (!it.duration || it.resume_pos < it.duration - 30)) {
+      const badge = el('span', 'resume', '▶ ' + fmt(it.resume_pos));
+      badge.title = 'ดูต่อจากนาทีนี้';
+      meta.insertBefore(badge, meta.firstChild);
+    }
     row.appendChild(meta);
     const del = el('button', 'rowdel', '✕');
     del.type = 'button';
@@ -338,6 +345,7 @@ async function pollPosition() {
   } catch { /* renderer busy */ }
 }
 setInterval(pollPosition, 2000);
+setInterval(async () => { try { const fresh = await api('/api/state'); STATE.prefs = fresh.prefs; const byId = new Map((fresh.prefs.playlists[0].items || []).map((x) => [x.id, x])); items.forEach((x) => { const f = byId.get(x.id); if (f) x.resume_pos = f.resume_pos; }); document.querySelectorAll('.row').forEach((row) => { const it = byId.get(row.dataset.id); const badge = row.querySelector('.resume'); const show = it && it.resume_pos > 10 && (!it.duration || it.resume_pos < it.duration - 30); if (show && badge) badge.textContent = '▶ ' + fmt(it.resume_pos); else if (show && !badge) { const b = el('span', 'resume', '▶ ' + fmt(it.resume_pos)); const meta = row.querySelector('.meta'); if (meta) meta.insertBefore(b, meta.firstChild); } else if (!show && badge) badge.remove(); }); } catch {} }, 15000);
 setInterval(async () => {
   try {
     const n = await api('/api/now');
@@ -358,7 +366,7 @@ setInterval(async () => {
 }, 5000);
 
 /* ----------------------------- cast ----------------------------- */
-async function castItem(id) {
+async function castItem(id, fromStart = false) {
   if (!deviceId) { openDevices(); toast('เลือกอุปกรณ์ก่อน'); return; }
   const it = items.find((x) => x.id === id);
   toast(`กำลังส่ง ${it ? it.title : ''} …`, 4000);
@@ -371,12 +379,12 @@ async function castItem(id) {
     const settings = {...readSettings(), last_item: id};
     await post('/api/settings', settings);
     STATE.prefs.settings = settings;
-    const r = await post('/api/cast', { device: deviceId, id });
+    const r = await post('/api/cast', { device: deviceId, id, from_start: fromStart });
     if (r.preparing) {
       $('#npTitle').textContent = it ? it.title : '';
       $('#npSub').textContent = 'กำลังเตรียมไฟล์ให้ทีวี…';
       await waitPrepare(id, it);
-      return castItem(id);
+      return castItem(id, fromStart);
     }
     $('#npTitle').textContent = r.message ? (it ? it.title : '') : '';
     $('#npSub').textContent = `casting on ${r.device || ''}`;
@@ -387,7 +395,7 @@ async function castItem(id) {
     $('#chipQuality').textContent = r.quality || '—';
     $('#chipProto').textContent = (r.url || '').includes('.m3u8') ? 'HLS (fMP4)' : 'direct play';
     $('#mediaUrl').textContent = r.url || '';
-    toast('ส่งขึ้นทีวีแล้ว');
+    toast(r.resumed_from > 10 ? `ดูต่อจาก ${fmt(r.resumed_from)}` : 'ส่งขึ้นทีวีแล้ว');
     STATE.now = { item_id: id, title: it ? it.title : '', device_name: r.device };
     document.querySelectorAll('.row').forEach((row) => row.classList.toggle('playing', row.dataset.id === id));
     setTimeout(pollPosition, 800);
@@ -827,6 +835,7 @@ function openCtx(ev, rowId) {
   head.textContent = many ? `เลือกอยู่ ${ids.length} รายการ` : (items.find((x) => x.id === selected)?.title || 'Playlist');
   ctxMenu.appendChild(head);
   ctxMenu.appendChild(ctxItem('Cast ไปทีวี', 'ดับเบิลคลิก', () => selected && castItem(selected), { disabled: many || !selected }));
+  ctxMenu.appendChild(ctxItem('เล่นตั้งแต่ต้น', '', () => selected && castItem(selected, true), { disabled: many || !selected }));
   ctxMenu.appendChild(ctxItem(many ? 'เลื่อนไปบนสุด' : 'เลื่อนไปบนสุด', '', () => moveSelection(true), { disabled: !ids.length }));
   ctxMenu.appendChild(ctxItem('เลื่อนไปล่างสุด', '', () => moveSelection(false), { disabled: !ids.length }));
   ctxMenu.appendChild(document.createElement('hr'));

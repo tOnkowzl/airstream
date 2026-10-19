@@ -37,6 +37,9 @@ pub struct Item {
     pub acodec: String,
     #[serde(default)]
     pub size: u64,
+    /// Where the user stopped (seconds). 0 = not started or finished.
+    #[serde(default)]
+    pub resume_pos: f64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -292,6 +295,7 @@ impl Library {
                 vcodec: String::new(),
                 acodec: String::new(),
                 size,
+                resume_pos: 0.0,
             };
             prefs.playlists[0].items.insert(insert_at, item);
             insert_at += 1;
@@ -344,6 +348,26 @@ impl Library {
         drop(prefs);
         self.save();
         true
+    }
+
+    /// Records the stop position of one item. Returns true when it changed enough to save.
+    pub fn set_resume(&self, id: &str, pos: f64) -> bool {
+        let mut prefs = self.prefs.lock().unwrap();
+        for playlist in prefs.playlists.iter_mut() {
+            for item in playlist.items.iter_mut() {
+                if item.id == id {
+                    let next = if pos.is_finite() && pos > 0.0 { pos } else { 0.0 };
+                    if (item.resume_pos - next).abs() < 4.0 && !(next == 0.0 && item.resume_pos != 0.0) {
+                        return false;
+                    }
+                    item.resume_pos = next;
+                    drop(prefs);
+                    self.save();
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Moves one item before another (or to the end when `before` is None).
@@ -487,6 +511,7 @@ impl Default for Item {
             vcodec: String::new(),
             acodec: String::new(),
             size: 0,
+            resume_pos: 0.0,
         }
     }
 }

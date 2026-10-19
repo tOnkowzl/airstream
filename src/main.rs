@@ -53,6 +53,7 @@ async fn main() {
 
     let state = Arc::new(server::AppState::new());
     server::start_device_discovery(state.clone());
+    server::start_resume_tracker(state.clone());
     let port = state.port;
     let url = format!("http://127.0.0.1:{}/", port);
 
@@ -83,6 +84,7 @@ async fn main() {
         let limit = if last == 0 { 40 } else { 12 };
         if idle > limit {
             tracing::info!("window closed — exiting");
+            server::save_resume_now(&state, &mut String::new());
             std::process::exit(0);
         }
     }

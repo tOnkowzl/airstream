@@ -7,7 +7,7 @@ $ErrorActionPreference = 'Stop'
 $source = (Resolve-Path -LiteralPath $SourceExe).Path
 $install = Join-Path $env:LOCALAPPDATA 'Programs\Airstream'
 $target = Join-Path $install 'airstream.exe'
-$version = '0.1.12'
+$version = '0.1.13'
 if (-not $MediaToolsDirectory) {
     $MediaToolsDirectory = Split-Path (Get-Command ffmpeg.exe -ErrorAction Stop).Source
 }

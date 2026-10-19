@@ -44,3 +44,9 @@ If Airflow (`Airflow.server.exe`) already owns port 42015, Airstream moves to th
 - Stop, switching items and receiver errors do not advance, because their idle reasons are not `FINISHED`.
 - During the last 3 minutes of an episode the next item is prepared in the background (`/api/cast` with `prepare_only`), so MKV remuxing is done before the episode ends.
 - The "เล่นอัตโนมัติใน playlist" setting is on by default. It existed in older preference files without any effect, so those files are migrated once to on; a later explicit choice is kept.
+
+## Resume where you stopped (v0.1.13)
+
+- While casting, the TV position is saved to the item every 3 seconds (and once more when the window closes). A finished item resets to the start.
+- Casting an item with a saved position continues from there on Google Cast; the toast says "ดูต่อจาก ...". The right-click menu has "เล่นตั้งแต่ต้น". Rows show a green "▶ mm:ss" badge.
+- Turning off "จำตำแหน่งล่าสุด (resume)" always starts from 0:00. Reopening the app reselects the last item.
