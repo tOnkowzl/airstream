@@ -18,6 +18,7 @@ mod dropfind;
 mod cast;
 mod library;
 mod probe;
+mod process;
 mod server;
 mod stream;
 mod transcode;
@@ -146,7 +147,7 @@ fn open_window(url: &str) {
             .spawn();
     } else {
         // Fallback: default browser.
-        let _ = std::process::Command::new("cmd")
+        let _ = crate::process::command("cmd")
             .args(["/C", "start", "", url])
             .spawn();
     }

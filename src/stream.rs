@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use tokio::process::{Child, ChildStdout, Command};
+use tokio::process::{Child, ChildStdout};
 use tokio_util::io::ReaderStream;
 
 use crate::transcode::{Mode, Transcoder};
@@ -48,7 +48,7 @@ impl PipeRegistry {
         self.stop(item_id);
         let mode = tc.pick_mode(crate::transcode::Quality::V1080, passthrough_ok, "auto");
 
-        let mut cmd = Command::new("ffmpeg");
+        let mut cmd = crate::process::async_command("ffmpeg");
         cmd.arg("-hide_banner").args(["-loglevel", "error", "-nostdin"]);
         if seek > 0.5 {
             cmd.args(["-ss", &format!("{seek:.3}")]);

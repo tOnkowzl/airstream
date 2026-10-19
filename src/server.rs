@@ -438,7 +438,7 @@ if ($f.ShowDialog() -eq 'OK') { $f.FileNames -join "`n" }"#;
 }
 
 fn run_ps(script: &str) -> Option<String> {
-    let out = std::process::Command::new("powershell")
+    let out = crate::process::command("powershell")
         .args(["-NoProfile", "-STA", "-Command", script])
         .output()
         .ok()?;
@@ -797,7 +797,7 @@ async fn ensure_vtt(item: &crate::library::Item, track: i32) -> Result<PathBuf, 
     static VTT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nonce = VTT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let temporary = prepared_dir().join(format!("{key}-{}-{nonce}.part.vtt", std::process::id()));
-    let result = tokio::process::Command::new("ffmpeg")
+    let result = crate::process::async_command("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i"])
         .arg(&item.path).args(["-map", &format!("0:s:{track}"), "-c:s", "webvtt", "-f", "webvtt"])
         .arg(&temporary).output().await.map_err(|e| e.to_string())?;
@@ -908,7 +908,7 @@ fn start_prepare(
     tokio::spawn(async move {
         let out = prepared_path(&cache_key);
         let tmp = out.with_extension("part.mp4");
-        let mut cmd = tokio::process::Command::new("ffmpeg");
+        let mut cmd = crate::process::async_command("ffmpeg");
         cmd.arg("-hide_banner").args(["-loglevel", "info", "-nostdin", "-y"]);
         cmd.arg("-i").arg(&path).args(["-map", "0:v:0"]);
         let audio_n = audio_track;
@@ -928,7 +928,7 @@ fn start_prepare(
         // filter filename. This avoids Windows drive-colon/quote escaping bugs.
         let subtitle_file = format!("{cache_key}.ass");
         if sub_track >= 0 {
-            let extraction = tokio::process::Command::new("ffmpeg")
+            let extraction = crate::process::async_command("ffmpeg")
                 .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i"])
                 .arg(&path).args(["-map", &format!("0:s:{sub_track}"), "-c:s", "ass"])
                 .arg(prepared_dir().join(&subtitle_file)).output().await;

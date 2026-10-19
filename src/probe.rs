@@ -2,7 +2,6 @@
 //! (video_0 / audio_0 / subtitle_0 stream inventory + bitrate estimation).
 
 use serde::Deserialize;
-use std::process::Command;
 
 #[derive(Deserialize, Debug, Default)]
 pub struct FfStream {
@@ -116,7 +115,7 @@ pub struct MediaInfo {
 }
 
 pub fn probe(path: &str) -> MediaInfo {
-    let out = Command::new("ffprobe")
+    let out = crate::process::command("ffprobe")
         .args([
             "-v",
             "error",
@@ -207,7 +206,7 @@ pub fn probe(path: &str) -> MediaInfo {
 /// Extracts one thumbnail frame as JPEG (used by the playlist view).
 pub fn thumbnail(path: &str, out: &std::path::Path, seek: f64) -> bool {
     let ts = format!("{:.2}", seek.max(1.0));
-    let status = Command::new("ffmpeg")
+    let status = crate::process::command("ffmpeg")
         .args([
             "-hide_banner",
             "-loglevel",

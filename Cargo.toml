@@ -1,6 +1,6 @@
 [package]
 name = "airstream"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2021"
 description = "Airflow-style local media caster, rewritten in Rust (clean-room, based on reverse-engineered behaviour)"
 license = "MIT"

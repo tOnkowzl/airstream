@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -124,7 +124,7 @@ pub fn detect_hw() -> HwSupport {
         }
     }
 
-    let out = Command::new("ffmpeg")
+    let out = crate::process::command("ffmpeg")
         .args(["-hide_banner", "-encoders"])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
@@ -188,7 +188,7 @@ fn ffmpeg_fingerprint() -> String {
 }
 
 fn smoke(encoder: &str, extra: &[&str]) -> bool {
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = crate::process::command("ffmpeg");
     cmd.args([
         "-hide_banner",
         "-loglevel",
@@ -286,7 +286,7 @@ impl Transcoder {
         let dir = self.root.join(&id);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
-        let mut cmd = Command::new("ffmpeg");
+        let mut cmd = crate::process::command("ffmpeg");
         cmd.arg("-hide_banner")
             .args(["-loglevel", "warning", "-nostdin"])
             .arg("-i")
