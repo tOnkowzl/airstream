@@ -39,6 +39,8 @@ pub struct CastStatus {
     pub title: String,
     pub transport_id: String,
     pub media_session_id: i64,
+    /// Why the receiver went IDLE (FINISHED, CANCELLED, INTERRUPTED, ERROR); kept until the next LOAD.
+    pub idle_reason: String,
     /// Session replaced by the latest LOAD; its late status messages are ignored.
     pub stale_session_id: i64,
     pub last_error: String,
@@ -381,6 +383,13 @@ pub async fn connect(host: &str, port: u16, device_name: &str) -> Result<CastCli
                                 }
                                 if let Some(p) = st.get("playerState").and_then(|x| x.as_str()) {
                                     s.player_state = p.to_string();
+                                    if p == "IDLE" {
+                                        if let Some(reason) = st.get("idleReason").and_then(|x| x.as_str()) {
+                                            s.idle_reason = reason.to_string();
+                                        }
+                                    } else {
+                                        s.idle_reason.clear();
+                                    }
                                 }
                                 if let Some(mid) = st.get("mediaSessionId").and_then(|x| x.as_i64()) {
                                     s.media_session_id = mid;
@@ -430,6 +439,7 @@ pub fn load(client: &CastClient, url: &str, title: &str, hls: bool, subtitle: Op
         status.last_error.clear();
         // Back-to-back LOADs: keep the older replaced session blocked too.
         if status.media_session_id != 0 { status.stale_session_id = status.media_session_id; }
+        status.idle_reason.clear();
         status.media_session_id = 0;
         status.active_track_ids.clear();
         status.media_tracks.clear();

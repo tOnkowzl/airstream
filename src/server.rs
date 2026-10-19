@@ -297,6 +297,8 @@ async fn api_set_settings(State(st): State<Arc<AppState>>, Json(s): Json<Setting
     if !valid_playback_rate(s.playback_rate) {
         return (StatusCode::BAD_REQUEST, Json(json!({"error":"เลือกความเร็ว ×1, ×1.25, ×1.5, ×1.75 หรือ ×2"}))).into_response();
     }
+    let mut s = s;
+    s.looping = false;
     st.save_settings(s.clone());
     Json(json!({ "ok": true, "settings": s })).into_response()
 }
@@ -567,6 +569,10 @@ struct CastReq {
     /// optional override: passthrough | variable-720p | variable-1080p | variable-1080p-hq
     #[serde(default)]
     quality: Option<String>,
+    /// Prepare the file (remux/subtitles) without touching the TV: used to
+    /// pre-warm the next episode so there is no wait at the end of this one.
+    #[serde(default)]
+    prepare_only: bool,
 }
 
 async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> impl IntoResponse {
@@ -678,6 +684,10 @@ async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> 
             quality.label().to_string(),
         )
     };
+
+    if req.prepare_only {
+        return Json(json!({ "ready": true, "prepared": true })).into_response();
+    }
 
     let msg = if device.kind == "cast" {
         let existing = {
@@ -1188,6 +1198,8 @@ async fn api_position(State(st): State<Arc<AppState>>, Query(q): Query<PosQuery>
             "via": "cast",
             "playback_rate": s.playback_rate,
             "title": s.title,
+            "idle_reason": s.idle_reason,
+            "media_session_id": s.media_session_id,
         }));
     }
     let id = q

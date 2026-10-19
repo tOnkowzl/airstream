@@ -84,8 +84,7 @@ function fillSettings(s) {
   $('#sSubLang').value = s.subtitleLanguages || 'TH;NONE';
   $('#sSubRender').checked = s.subtitleRendering !== false;
   $('#sSubScale').value = s.subtitleScaleAdjustment || s.subtitle_scale || 1;
-  $('#sAutoPlay').checked = !!s.auto_play;
-  $('#sLoop').checked = !!s.looping;
+  $('#sAutoPlay').checked = s.auto_play !== false;
   $('#sResume').checked = s.resume !== false;
 }
 
@@ -106,7 +105,8 @@ function readSettings() {
     audio_track: parseInt($('#selAudio').value, 10),
     subtitle_track: parseInt($('#selSubs').value, 10),
     auto_play: $('#sAutoPlay').checked,
-    looping: $('#sLoop').checked,
+    autoplay_choice: true,
+    looping: false,
     resume: $('#sResume').checked,
     last_device: deviceId,
     last_item: selected || '',
@@ -328,6 +328,7 @@ async function pollPosition() {
     $('#tElapsed').textContent = fmt(p.elapsed);
     $('#tTotal').textContent = total > 0 ? fmt(total) : '--:--:--';
     const st = (p.state || 'IDLE').toUpperCase();
+    watchPlaylistAdvance(p, st, total);
     const map = { PLAYING: ['playing', 'PLAYING'], PAUSED: ['paused', 'PAUSED'], STOPPED: ['stopped', 'STOPPED'], NO_MEDIA_PRESENT: ['', 'NO MEDIA'], TRANSITIONING: ['', 'BUFFERING'] };
     const [cls, label] = map[st] || ['', st];
     $('#tState').textContent = label;
@@ -498,7 +499,7 @@ $('#btnRefreshDevices').onclick = openDevices;
 /* ----------------------------- settings ----------------------------- */
 $('#btnSettings').onclick = () => { closePops(); $('#setPopup').classList.remove('hidden'); };
 $('#btnCloseSet').onclick = () => $('#setPopup').classList.add('hidden');
-['#sQuality', '#sEncoder', '#sSegment', '#sAudioLang', '#sSubLang', '#sSubRender', '#sSubScale', '#sAutoPlay', '#sLoop', '#sResume']
+['#sQuality', '#sEncoder', '#sSegment', '#sAudioLang', '#sSubLang', '#sSubRender', '#sSubScale', '#sAutoPlay', '#sResume']
   .forEach((sel) => {
     const n = $(sel);
     n.addEventListener('change', scheduleSave);
@@ -860,3 +861,46 @@ document.addEventListener('keydown', (ev) => {
   else if (ev.key === 'ArrowDown' && buttons.length) { ev.preventDefault(); buttons[(at + 1) % buttons.length].focus(); }
   else if (ev.key === 'ArrowUp' && buttons.length) { ev.preventDefault(); buttons[(at - 1 + buttons.length) % buttons.length].focus(); }
 }, true);
+
+
+/* ------------------ auto-play the next playlist item ------------------ */
+const prewarmed = new Set();      // next items already asked to prepare
+const advancedFrom = new Set();   // finished sessions that already advanced
+let advancing = false;
+
+function nextAfter(id) {
+  const at = items.findIndex((x) => x.id === id);
+  if (at < 0) return null;
+  // Play what is in the list, then stop: never wrap around to the first item.
+  return at + 1 < items.length ? items[at + 1] : null;
+}
+
+async function prewarmNext(currentId) {
+  const next = nextAfter(currentId);
+  if (!next || next.id === currentId || prewarmed.has(next.id) || !deviceId) return;
+  prewarmed.add(next.id);
+  try {
+    const r = await post('/api/cast', { device: deviceId, id: next.id, prepare_only: true });
+    if (r.preparing) setTimeout(() => prewarmed.delete(next.id), 20 * 60 * 1000); // allow a retry later
+  } catch { prewarmed.delete(next.id); }
+}
+
+async function watchPlaylistAdvance(p, st, total) {
+  if (!$('#sAutoPlay').checked || advancing || p.via !== 'cast') return;
+  const playingId = STATE.now && STATE.now.item_id;
+  if (!playingId) return;
+  // Warm the next episode while this one is still playing (last 3 minutes).
+  if (st === 'PLAYING' && total > 0 && total - p.elapsed < 180) prewarmNext(playingId);
+  if (st !== 'IDLE' || p.idle_reason !== 'FINISHED') return;   // Stop/interrupt/error must not advance
+  const key = `${playingId}:${p.media_session_id}`;
+  if (advancedFrom.has(key)) return;
+  advancedFrom.add(key);
+  const next = nextAfter(playingId);
+  if (!next) { toast('เล่นจบทั้ง Playlist แล้ว'); return; }
+  advancing = true;
+  try {
+    toast(`เล่นต่อ: ${next.title || next.path}`, 3500);
+    select(next.id);
+    await castItem(next.id);
+  } finally { advancing = false; }
+}

@@ -87,6 +87,9 @@ pub struct Prefs {
 pub struct Settings {
     #[serde(default = "normal_playback_rate")]
     pub playback_rate: f64,
+    /// True once the user (or the one-time migration) decided about auto-play.
+    #[serde(default)]
+    pub autoplay_choice: bool,
     /// Remembered track choices applied to every new episode/file.
     #[serde(default)]
     pub audio_pref: Option<TrackPref>,
@@ -126,6 +129,7 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             playback_rate: 1.0,
+            autoplay_choice: true,
             audio_pref: None,
             subtitle_pref: None,
             subtitle_off: false,
@@ -136,7 +140,7 @@ impl Default for Settings {
             subtitle_language: "TH;NONE".into(),
             subtitle_rendering: true,
             subtitle_scale: 1.0,
-            auto_play: false,
+            auto_play: true,
             looping: false,
             resume: true,
             last_device: String::new(),
@@ -197,6 +201,13 @@ impl Library {
         let path = dir.join("PlaylistManager.prefs");
 
         let mut prefs = read_prefs(&path).unwrap_or_default();
+        // Playlists play through once and stop; the old loop option is retired.
+        prefs.settings.looping = false;
+        // `auto_play` existed but did nothing, so old files hold an unchosen false.
+        if !prefs.settings.autoplay_choice {
+            prefs.settings.auto_play = true;
+            prefs.settings.autoplay_choice = true;
+        }
         if ![1.0, 1.25, 1.5, 1.75, 2.0].contains(&prefs.settings.playback_rate) {
             prefs.settings.playback_rate = 1.0;
         }

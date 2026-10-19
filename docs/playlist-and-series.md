@@ -37,3 +37,10 @@ If Airflow (`Airflow.server.exe`) already owns port 42015, Airstream moves to th
 - Dragging any selected row moves the whole selection, keeping its order (`/api/playlist/move` with `ids`).
 - Right-click opens a menu: Cast, move to top/bottom, select all, clear selection, remove. Shift+right-click extends the range first. Right-clicking an unselected row selects just that row; right-clicking inside the selection keeps it. Arrow keys navigate the menu and Esc closes it.
 - A new Cast LOAD clears the previous media session's subtitle/track state, including during back-to-back casts.
+
+## Auto-play next episode (v0.1.12)
+
+- When the receiver reports `IDLE` with reason `FINISHED`, the app selects and casts the next playlist item, using the remembered audio, subtitle and speed. It plays the list once and stops after the last item with a notice; there is no loop (the old loop option was removed).
+- Stop, switching items and receiver errors do not advance, because their idle reasons are not `FINISHED`.
+- During the last 3 minutes of an episode the next item is prepared in the background (`/api/cast` with `prepare_only`), so MKV remuxing is done before the episode ends.
+- The "เล่นอัตโนมัติใน playlist" setting is on by default. It existed in older preference files without any effect, so those files are migrated once to on; a later explicit choice is kept.
