@@ -228,3 +228,67 @@ pub fn thumbnail(path: &str, out: &std::path::Path, seek: f64) -> bool {
         .status();
     matches!(status, Ok(s) if s.success())
 }
+
+/// Normalises ISO-639 variants (tha/th, chi/zho/zh, jp/jpn ...) for matching.
+pub fn canonical_lang(raw: &str) -> String {
+    let l = raw.trim().to_lowercase();
+    match l.as_str() {
+        "" | "und" | "unk" | "zxx" => String::new(),
+        "th" | "tha" => "th".into(),
+        "en" | "eng" => "en".into(),
+        "ja" | "jp" | "jpn" => "ja".into(),
+        "ko" | "kor" => "ko".into(),
+        "zh" | "zho" | "chi" | "cmn" | "yue" | "chs" | "cht" => "zh".into(),
+        "fr" | "fra" | "fre" => "fr".into(),
+        "de" | "deu" | "ger" => "de".into(),
+        "es" | "spa" => "es".into(),
+        _ => l,
+    }
+}
+
+// forced=1, hearing-impaired/captions=2, commentary/description=4
+fn title_flags(title: &str) -> u8 {
+    let t = title.to_lowercase();
+    let mut flags = 0;
+    if t.contains("forced") { flags |= 1 }
+    if t.contains("sdh") || t.contains("hearing") || t.contains("caption") { flags |= 2 }
+    if t.contains("commentary") || t.contains("descriptive") || t.contains("audio description") { flags |= 4 }
+    flags
+}
+
+fn title_key(title: &str) -> String {
+    title.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase()
+}
+
+/// Finds the track that best matches a remembered choice, or -1.
+/// The language must match (when the choice had one). Within a language the
+/// score prefers the same forced/SDH/commentary kind, title, codec, channel
+/// count and finally the same position, so two identically named tracks stay
+/// distinguishable. `usable_only` restricts subtitles to text tracks.
+pub fn pick_track(tracks: &[Track], wanted: &crate::library::TrackPref, usable_only: bool) -> i32 {
+    let want_lang = canonical_lang(&wanted.lang);
+    let want_flags = title_flags(&wanted.title);
+    let want_title = title_key(&wanted.title);
+    let mut same_language = 0u32;
+    let mut best: Option<(u32, usize)> = None;
+    for (index, track) in tracks.iter().enumerate() {
+        if !want_lang.is_empty() && canonical_lang(&track.lang) != want_lang {
+            continue;
+        }
+        let nth = same_language;
+        same_language += 1;
+        if usable_only && !track.burnable {
+            continue;
+        }
+        let mut score = 0u32;
+        if title_flags(&track.title) == want_flags { score += 32 }
+        if title_key(&track.title) == want_title { score += 16 }
+        if track.codec == wanted.codec { score += 8 }
+        if track.channels == wanted.channels { score += 4 }
+        if nth == wanted.nth { score += 2 }
+        if best.map(|(top, _)| score > top).unwrap_or(true) {
+            best = Some((score, index));
+        }
+    }
+    best.map(|(_, index)| index as i32).unwrap_or(-1)
+}

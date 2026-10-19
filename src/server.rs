@@ -11,7 +11,7 @@ use crate::probe;
 use crate::transcode::{Quality, Transcoder};
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -19,7 +19,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
-use std::net::TcpListener as StdListener;
+use std::net::{SocketAddr, TcpListener as StdListener};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -52,6 +52,8 @@ pub struct AppState {
     /// Prepared (faststart) MP4 files: cast targets that support exact seeking.
     pub prep: Mutex<std::collections::HashMap<String, PrepState>>,
     pub subtitle_fetches: std::sync::atomic::AtomicU64,
+    /// Only one filesystem search for dropped files runs at a time.
+    pub drop_scan: tokio::sync::Mutex<()>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -90,6 +92,7 @@ impl AppState {
             cast: Mutex::new(None),
             prep: Mutex::new(std::collections::HashMap::new()),
             subtitle_fetches: std::sync::atomic::AtomicU64::new(0),
+            drop_scan: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -118,11 +121,46 @@ impl AppState {
 }
 
 
-/// A stored track index may not exist in the new file: clamp it.
-fn clamp_tracks(mi: &probe::MediaInfo, audio: i32, sub: i32) -> (i32, i32) {
-    let a = if audio >= 0 && (audio as usize) < mi.audio_tracks.len() { audio } else { -1 };
-    let s = if sub >= 0 && (sub as usize) < mi.sub_tracks.len() { sub } else { -1 };
-    (a, s)
+fn valid_index(index: i32, len: usize) -> bool {
+    index >= 0 && (index as usize) < len
+}
+
+fn language_hint(setting: &str) -> Option<String> {
+    let first = setting.split(';').next()?.trim();
+    if first.is_empty() || first.eq_ignore_ascii_case("none") || first.eq_ignore_ascii_case("auto") {
+        None
+    } else {
+        Some(probe::canonical_lang(first))
+    }
+}
+
+/// Resolves the audio/subtitle indexes for THIS file from the saved choices.
+/// Remembered choices (by language/title/codec) follow the user from episode
+/// to episode. A positional index is trusted only for the file it was saved
+/// for, so one movie's track numbers never leak into another file.
+fn resolve_tracks(mi: &probe::MediaInfo, s: &Settings, item_id: &str) -> (i32, i32) {
+    let same_item = s.last_item == item_id;
+    let audio = if let Some(pref) = &s.audio_pref {
+        probe::pick_track(&mi.audio_tracks, pref, false)
+    } else if same_item && valid_index(s.audio_track, mi.audio_tracks.len()) {
+        s.audio_track
+    } else if let Some(lang) = language_hint(&s.audio_language) {
+        mi.audio_tracks.iter().position(|t| probe::canonical_lang(&t.lang) == lang).map(|i| i as i32).unwrap_or(-1)
+    } else {
+        -1
+    };
+    let subtitle = if s.subtitle_off {
+        -1
+    } else if let Some(pref) = &s.subtitle_pref {
+        probe::pick_track(&mi.sub_tracks, pref, true)
+    } else if same_item && valid_index(s.subtitle_track, mi.sub_tracks.len()) {
+        s.subtitle_track
+    } else if let Some(lang) = language_hint(&s.subtitle_language) {
+        mi.sub_tracks.iter().position(|t| t.burnable && probe::canonical_lang(&t.lang) == lang).map(|i| i as i32).unwrap_or(-1)
+    } else {
+        -1
+    };
+    (audio, subtitle)
 }
 
 fn pick_port(preferred: u16) -> u16 {
@@ -159,6 +197,8 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error
         .route("/api/state", get(api_state))
         .route("/api/settings", get(api_get_settings).post(api_set_settings))
         .route("/api/add", post(api_add))
+        .route("/api/add_dropped", post(api_add_dropped))
+        .route("/api/playlist/move", post(api_playlist_move))
         .route("/api/pick_folder", post(api_pick_folder))
         .route("/api/pick_files", post(api_pick_files))
         .route("/api/open_prefs", post(api_open_prefs))
@@ -183,7 +223,7 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error
         .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", state.port)).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
 }
 
@@ -268,6 +308,76 @@ struct AddReq {
 async fn api_add(State(st): State<Arc<AppState>>, Json(req): Json<AddReq>) -> impl IntoResponse {
     let (added, skipped) = st.library.add_paths(&req.paths);
     Json(json!({ "added": added, "skipped": skipped }))
+}
+
+#[derive(Deserialize)]
+struct DroppedReq {
+    files: Vec<crate::dropfind::DroppedFile>,
+    #[serde(default)]
+    before: Option<String>,
+}
+
+/// Adds files dropped from Explorer. Browser JavaScript only sees name, size
+/// and modified time, so the local path is recovered by matching all three.
+/// This searches the user's disks, therefore it is limited to this computer.
+async fn api_add_dropped(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<DroppedReq>,
+) -> Response {
+    if !peer.ip().is_loopback() {
+        return (StatusCode::FORBIDDEN, Json(json!({"error": "drag and drop import is local-only"}))).into_response();
+    }
+    if req.files.is_empty() || req.files.len() > 1000 {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "ส่งไฟล์ได้ 1-1000 รายการต่อครั้ง"}))).into_response();
+    }
+    let Ok(_scan_guard) = st.drop_scan.try_lock() else {
+        return (StatusCode::CONFLICT, Json(json!({"error": "กำลังค้นหาไฟล์จากการวางก่อนหน้า กรุณารอสักครู่"}))).into_response();
+    };
+    let (video, unsupported): (Vec<_>, Vec<_>) = req.files.into_iter().partition(|f| {
+        std::path::Path::new(&f.name)
+            .extension()
+            .map(|e| crate::library::VIDEO_EXTS.contains(&e.to_string_lossy().to_lowercase().as_str()))
+            .unwrap_or(false)
+    });
+    let started = std::time::Instant::now();
+    let to_search = video.clone();
+    let (found, timed_out) = tokio::task::spawn_blocking(move || crate::dropfind::resolve(&to_search, std::time::Duration::from_secs(25)))
+        .await
+        .unwrap_or((Vec::new(), false));
+    let mut paths = Vec::new();
+    let mut missing = Vec::new();
+    for (file, path) in video.iter().zip(found.iter()) {
+        match path {
+            Some(path) => paths.push(path.to_string_lossy().to_string()),
+            None => missing.push(file.name.clone()),
+        }
+    }
+    let (added, skipped) = st.library.add_paths_at(&paths, req.before.as_deref());
+    Json(json!({
+        "added": added,
+        "skipped": skipped,
+        "missing": missing,
+        "unsupported": unsupported.into_iter().map(|f| f.name).collect::<Vec<_>>(),
+        "timed_out": timed_out,
+        "seconds": started.elapsed().as_secs_f64(),
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct MoveReq {
+    id: String,
+    #[serde(default)]
+    before: Option<String>,
+}
+
+async fn api_playlist_move(State(st): State<Arc<AppState>>, Json(req): Json<MoveReq>) -> Response {
+    if st.library.move_item(&req.id, req.before.as_deref()) {
+        Json(json!({"ok": true})).into_response()
+    } else {
+        (StatusCode::CONFLICT, Json(json!({"error": "รายการเปลี่ยนไปแล้ว กำลังรีเฟรช"}))).into_response()
+    }
 }
 
 async fn api_open_prefs(State(st): State<Arc<AppState>>) -> impl IntoResponse {
@@ -364,13 +474,16 @@ async fn api_item_tracks(State(st): State<Arc<AppState>>, Path(id): Path<String>
     let Some(item) = st.find_item(&id) else {
         return (StatusCode::NOT_FOUND, Json(json!({"error":"not found"}))).into_response();
     };
+    let item_id = item.id.clone();
     let mi = tokio::task::spawn_blocking(move || probe::probe(&item.path))
         .await
         .unwrap_or_default();
+    let (audio, subtitle) = resolve_tracks(&mi, &st.settings(), &item_id);
     Json(json!({
         "audio": mi.audio_tracks,
         "subtitles": mi.sub_tracks,
         "duration": mi.duration,
+        "resolved": { "audio": audio, "subtitle": subtitle },
     }))
     .into_response()
 }
@@ -459,7 +572,7 @@ async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> 
     };
 
     // A plain MP4 the receiver can decode is streamed straight from disk.
-    let (audio_track, subtitle_track) = clamp_tracks(&mi, settings.audio_track, settings.subtitle_track);
+    let (audio_track, subtitle_track) = resolve_tracks(&mi, &settings, &item.id);
     if subtitle_track >= 0 && !mi.sub_tracks[subtitle_track as usize].burnable {
         return (StatusCode::BAD_REQUEST, Json(json!({"error":"Selected bitmap subtitles cannot be burned in by this renderer; choose a text subtitle track."}))).into_response();
     }
@@ -1111,8 +1224,8 @@ async fn api_play(State(st): State<Arc<AppState>>, Json(req): Json<PlayReq>) -> 
             &s.encoder,
             s.hls_segment,
             "fmp4",
-            clamp_tracks(&mi, s.audio_track, if s.subtitle_rendering { s.subtitle_track } else { -1 }).0,
-            clamp_tracks(&mi, s.audio_track, if s.subtitle_rendering { s.subtitle_track } else { -1 }).1,
+            resolve_tracks(&mi, &s, &item.id).0,
+            if s.subtitle_rendering { resolve_tracks(&mi, &s, &item.id).1 } else { -1 },
             s.subtitle_scale,
         )
     {

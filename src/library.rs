@@ -50,6 +50,24 @@ pub struct Playlist {
     pub looping: bool,
 }
 
+/// A remembered audio/subtitle choice, stored by what the track *is*
+/// (language, title, codec, channels) instead of its position, because episode
+/// files of one series rarely keep identical track order.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TrackPref {
+    #[serde(default)]
+    pub lang: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub codec: String,
+    #[serde(default)]
+    pub channels: u32,
+    /// Position among tracks of the same language; separates identical titles.
+    #[serde(default)]
+    pub nth: u32,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Prefs {
     #[serde(default)]
@@ -69,6 +87,14 @@ pub struct Prefs {
 pub struct Settings {
     #[serde(default = "normal_playback_rate")]
     pub playback_rate: f64,
+    /// Remembered track choices applied to every new episode/file.
+    #[serde(default)]
+    pub audio_pref: Option<TrackPref>,
+    #[serde(default)]
+    pub subtitle_pref: Option<TrackPref>,
+    /// The user explicitly chose "subtitles off" (do not auto-enable them).
+    #[serde(default)]
+    pub subtitle_off: bool,
     /// passthrough | variable-720p | variable-1080p | variable-1080p-hq
     pub quality: String,
     /// auto | nvenc | amf | qsv | x264
@@ -100,6 +126,9 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             playback_rate: 1.0,
+            audio_pref: None,
+            subtitle_pref: None,
+            subtitle_off: false,
             quality: "passthrough".into(),
             encoder: "auto".into(),
             audio_language: "TH".into(),
@@ -210,6 +239,12 @@ impl Library {
     }
 
     pub fn add_paths(&self, paths: &[String]) -> (usize, usize) {
+        self.add_paths_at(paths, None)
+    }
+
+    /// Adds files/folders, optionally inserting them before an existing item.
+    /// Duplicate detection ignores slash style and letter case (Windows paths).
+    pub fn add_paths_at(&self, paths: &[String], before: Option<&str>) -> (usize, usize) {
         let mut added = 0usize;
         let mut skipped = 0usize;
         let mut files: Vec<PathBuf> = Vec::new();
@@ -221,10 +256,14 @@ impl Library {
                 files.push(path);
             }
         }
+        let same_path = |a: &str, b: &str| a.replace('\\', "/").eq_ignore_ascii_case(&b.replace('\\', "/"));
         let mut prefs = self.prefs.lock().unwrap();
+        let mut insert_at = before
+            .and_then(|b| prefs.playlists[0].items.iter().position(|i| i.id == b))
+            .unwrap_or(prefs.playlists[0].items.len());
         for f in files {
-            let s = f.to_string_lossy().to_string();
-            let dup = prefs.playlists.iter().any(|p| p.items.iter().any(|i| i.path == s));
+            let s = f.to_string_lossy().replace('\\', "/");
+            let dup = prefs.playlists.iter().any(|p| p.items.iter().any(|i| same_path(&i.path, &s)));
             if dup {
                 skipped += 1;
                 continue;
@@ -243,12 +282,72 @@ impl Library {
                 acodec: String::new(),
                 size,
             };
-            prefs.playlists[0].items.push(item);
+            prefs.playlists[0].items.insert(insert_at, item);
+            insert_at += 1;
             added += 1;
         }
         drop(prefs);
         self.save();
         (added, skipped)
+    }
+
+    /// Moves one item before another (or to the end when `before` is None).
+    /// Returns false for stale ids so the UI can refresh instead of guessing.
+    pub fn move_item(&self, id: &str, before: Option<&str>) -> bool {
+        let mut prefs = self.prefs.lock().unwrap();
+        let items = &mut prefs.playlists[0].items;
+        let Some(from) = items.iter().position(|i| i.id == id) else { return false };
+        if let Some(target) = before {
+            if target == id {
+                return true;
+            }
+            if !items.iter().any(|i| i.id == target) {
+                return false;
+            }
+        }
+        let item = items.remove(from);
+        let to = before
+            .and_then(|b| items.iter().position(|i| i.id == b))
+            .unwrap_or(items.len());
+        items.insert(to, item);
+        drop(prefs);
+        self.save();
+        true
+    }
+}
+
+/// Natural ordering: E2 before E10, case-insensitive.
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let (a, b) = (a.to_lowercase(), b.to_lowercase());
+    let (mut x, mut y) = (a.chars().peekable(), b.chars().peekable());
+    loop {
+        match (x.peek().copied(), y.peek().copied()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, _) => return std::cmp::Ordering::Less,
+            (_, None) => return std::cmp::Ordering::Greater,
+            (Some(c), Some(d)) if c.is_ascii_digit() && d.is_ascii_digit() => {
+                let mut left = String::new();
+                while let Some(&ch) = x.peek() {
+                    if !ch.is_ascii_digit() { break }
+                    left.push(ch);
+                    x.next();
+                }
+                let mut right = String::new();
+                while let Some(&ch) = y.peek() {
+                    if !ch.is_ascii_digit() { break }
+                    right.push(ch);
+                    y.next();
+                }
+                let (left, right) = (left.trim_start_matches('0'), right.trim_start_matches('0'));
+                let order = left.len().cmp(&right.len()).then_with(|| left.cmp(right));
+                if order != std::cmp::Ordering::Equal { return order }
+            }
+            (Some(c), Some(d)) => {
+                if c != d { return c.cmp(&d) }
+                x.next();
+                y.next();
+            }
+        }
     }
 }
 
@@ -257,8 +356,9 @@ fn collect_videos(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
         return;
     }
     let Ok(rd) = std::fs::read_dir(dir) else { return };
-    for e in rd.flatten() {
-        let p = e.path();
+    let mut entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+    entries.sort_by(|a, b| natural_cmp(&a.file_name().unwrap_or_default().to_string_lossy(), &b.file_name().unwrap_or_default().to_string_lossy()));
+    for p in entries {
         if p.is_dir() {
             collect_videos(&p, out, depth + 1);
         } else if let Some(ext) = p.extension() {

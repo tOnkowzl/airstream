@@ -39,6 +39,8 @@ pub struct CastStatus {
     pub title: String,
     pub transport_id: String,
     pub media_session_id: i64,
+    /// Session replaced by the latest LOAD; its late status messages are ignored.
+    pub stale_session_id: i64,
     pub last_error: String,
     pub active_track_ids: Vec<i64>,
     pub media_tracks: Vec<Value>,
@@ -344,10 +346,25 @@ pub async fn connect(host: &str, port: u16, device_name: &str) -> Result<CastCli
                             let detail = payload.chars().take(700).collect::<String>();
                             s.last_error = format!("{ty}: {detail}");
                             s.last_error_request_id = v.get("requestId").and_then(|x| x.as_u64()).unwrap_or(0);
+                            if ty == "LOAD_FAILED" || ty == "LOAD_CANCELLED" {
+                                // The previous media may still be the active session.
+                                s.stale_session_id = 0;
+                            }
                         }
                         if let Some(arr) = v.get("status").and_then(|x| x.as_array()) {
                             if let Some(st) = arr.first() {
                                 let mut s = status_r.lock().unwrap();
+                                let session = st.get("mediaSessionId").and_then(|x| x.as_i64()).unwrap_or(0);
+                                if session != 0 && session == s.stale_session_id {
+                                    // Late message from the media that this LOAD replaced.
+                                    continue;
+                                }
+                                if session != 0 && session != s.media_session_id {
+                                    // A new media session starts without the previous tracks.
+                                    s.active_track_ids.clear();
+                                    s.media_tracks.clear();
+                                    s.stale_session_id = 0;
+                                }
                                 s.status_revision += 1;
                                 if let Some(rate) = st.get("playbackRate").and_then(|x| x.as_f64()) { s.playback_rate = rate; }
                                 if let Some(ids) = st.get("activeTrackIds").and_then(|x| x.as_array()) {
@@ -411,6 +428,8 @@ pub fn load(client: &CastClient, url: &str, title: &str, hls: bool, subtitle: Op
     {
         let mut status = client.status.lock().unwrap();
         status.last_error.clear();
+        status.stale_session_id = status.media_session_id;
+        status.media_session_id = 0;
         status.player_state = "LOADING".into();
         status.current_time = 0.0;
         status.playback_rate = 1.0;

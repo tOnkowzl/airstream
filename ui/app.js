@@ -9,6 +9,12 @@ let deviceId = '';
 let position = { elapsed: 0, duration: 0, state: 'IDLE' };
 let probeQueue = [], probing = 0;
 let nowHls = false;
+let playlistRendered = false;
+let dragId = null;
+// Remembered track choices (sent to the server, applied to every new episode).
+let audioPref = null, subtitlePref = null, subtitleOff = false;
+let loadedTracks = { audio: [], subtitles: [] };
+const ITEM_MIME = 'application/x-airstream-item';
 
 const fmt = (s) => {
   if (!isFinite(s) || s <= 0) return '--:--:--';
@@ -62,6 +68,9 @@ async function boot() {
 }
 
 function fillSettings(s) {
+  audioPref = s.audio_pref || null;
+  subtitlePref = s.subtitle_pref || null;
+  subtitleOff = !!s.subtitle_off;
   preferredRate = Number(s.playback_rate) || 1;
   updateSpeed(confirmedRate, rateAvailable);
   $('#sQuality').value = s.quality || 'variable-1080p';
@@ -79,6 +88,9 @@ function fillSettings(s) {
 function readSettings() {
   return {
     playback_rate: preferredRate,
+    audio_pref: audioPref,
+    subtitle_pref: subtitlePref,
+    subtitle_off: subtitleOff,
     quality: $('#sQuality').value,
     encoder: $('#sEncoder').value,
     hls_segment: parseInt($('#sSegment').value, 10) || 4,
@@ -122,20 +134,42 @@ function render() {
     rows.appendChild(e);
     return;
   }
+  rows.classList.toggle('noanim', playlistRendered);
+  playlistRendered = true;
   for (const it of items) {
     const row = el('div', 'row');
     row.dataset.id = it.id;
+    row.draggable = true;
     if (it.id === selected) row.classList.add('sel');
     if (STATE.now && STATE.now.item_id === it.id) row.classList.add('playing');
+    const grip = el('div', 'grip', '⋮⋮');
+    grip.title = 'ลากเพื่อสลับตำแหน่ง';
+    row.appendChild(grip);
     row.appendChild(el('div', 'dot'));
-    row.appendChild(el('div', 'name', it.title || it.path.split(/[\\/]/).pop()));
+    const title = it.title || it.path.split(/[\\/]/).pop();
+    row.appendChild(el('div', 'name', title));
     const meta = el('div', 'meta');
     const codec = el('span', 'codec', (it.vcodec || '').toUpperCase());
     meta.appendChild(codec);
     meta.appendChild(document.createTextNode(it.duration > 0 ? fmt(it.duration) : ''));
     row.appendChild(meta);
+    const del = el('button', 'rowdel', '✕');
+    del.type = 'button';
+    del.title = 'เอาออกจาก Playlist (ไม่ลบไฟล์จริง)';
+    del.setAttribute('aria-label', `เอา ${title} ออกจาก Playlist`);
+    del.onclick = (ev) => { ev.stopPropagation(); removeItem(it.id); };
+    del.ondblclick = (ev) => ev.stopPropagation();
+    row.appendChild(del);
     row.onclick = () => select(it.id);
     row.ondblclick = () => castItem(it.id);
+    row.addEventListener('dragstart', (ev) => {
+      dragId = it.id;
+      ev.dataTransfer.effectAllowed = 'move';
+      ev.dataTransfer.setData(ITEM_MIME, it.id);
+      ev.dataTransfer.setData('text/plain', title);
+      requestAnimationFrame(() => row.classList.add('dragging'));
+    });
+    row.addEventListener('dragend', () => { dragId = null; row.classList.remove('dragging'); clearDropMarks(); });
     rows.appendChild(row);
     if (!it.duration) probeQueue.push(it.id);
   }
@@ -184,24 +218,15 @@ async function populateTracks(id) {
       if (!tr.burnable) o.disabled = true;
       s.appendChild(o);
     });
-    const st = STATE.prefs.settings || {};
-    if (st.audio_track >= 0) a.value = String(st.audio_track);
-    if (st.subtitle_track >= 0) s.value = String(st.subtitle_track);
-    if (!s.value) s.value = '-1';
+    loadedTracks = { audio: t.audio || [], subtitles: t.subtitles || [] };
+    // The server resolves the saved choices against THIS file (same language/title/codec).
+    const r = t.resolved || { audio: -1, subtitle: -1 };
+    a.value = String(r.audio);
+    s.value = String(r.subtitle);
     if (!a.value) a.value = '-1';
+    if (!s.value) s.value = '-1';
     $('#sSubRender').checked = parseInt(s.value, 10) >= 0;
-    // auto-pick preferred language when nothing explicit is chosen
-    if (st.audio_track === -1 && st.audioLanguages) {
-      const pref = st.audioLanguages.toUpperCase();
-      const lang = {THA:'TH',ENG:'EN',JPN:'JP',KOR:'KO'};
-      const hit = (t.audio || []).find((tr) => (lang[(tr.lang || '').toUpperCase()] || (tr.lang || '').toUpperCase()) === pref);
-      if (hit) a.value = String(hit.n);
-    }
-    if (st.subtitle_track === -1 && (st.subtitleLanguages || '').startsWith('TH')) {
-      const hit = (t.subtitles || []).find((tr) => ['TH','THA'].includes((tr.lang || '').toUpperCase()) && tr.burnable);
-      if (hit) s.value = String(hit.n);
-    }
-    $('#sSubRender').checked = parseInt(s.value, 10) >= 0;
+    showTrackHint(r);
   } catch (e) {
     a.innerHTML = '<option value="-1">อ่านไฟล์ไม่สำเร็จ</option>';
     s.innerHTML = '<option value="-1">ปิด</option>';
@@ -468,14 +493,6 @@ primeDevices();
 setInterval(primeDevices, 1500);
 
 // Selecting a subtitle is the on/off control; keep the advanced toggle in sync.
-$('#selSubs').addEventListener('change', () => {
-  $('#sSubRender').checked = parseInt($('#selSubs').value, 10) >= 0;
-  scheduleSave();
-});
-$('#selAudio').addEventListener('change', scheduleSave);
-$('#sSubRender').addEventListener('change', () => {
-  if (!$('#sSubRender').checked) $('#selSubs').value = '-1';
-});
 
 let rateBusy = false, confirmedRate = 1, preferredRate = 1, rateAvailable = false;
 function updateSpeed(rate, available) {
@@ -510,4 +527,192 @@ document.querySelectorAll('[data-playback-rate]').forEach(button => {
     } catch (e) { toast(e.message, 6500); }
     finally { rateBusy = false; updateSpeed(confirmedRate, rateAvailable); await pollPosition(); }
   });
+});
+
+
+/* ------------------ playlist: remove, reorder, drop from Explorer ------------------ */
+async function refreshPlaylist() {
+  const fresh = await api('/api/state');
+  STATE.prefs = fresh.prefs;
+  STATE.now = fresh.now;
+  render();
+}
+
+async function removeItem(id) {
+  const index = items.findIndex((x) => x.id === id);
+  if (index < 0) return;
+  const removed = items[index];
+  const title = removed.title || removed.path;
+  try {
+    await api('/api/item/' + encodeURIComponent(id), { method: 'DELETE' });
+    if (selected === id) { selected = null; tracksFor = ''; }
+    await refreshPlaylist();
+    if (!selected && items.length) select(items[Math.min(index, items.length - 1)].id);
+    const playing = STATE.now && STATE.now.item_id === id;
+    toast(`เอาออกแล้ว: ${title}${playing ? ' (ทีวียังเล่นอยู่ กด หยุด เพื่อหยุด)' : ''} · ไฟล์จริงยังอยู่`, 4200);
+  } catch (e) { toast('เอาออกไม่สำเร็จ: ' + e.message, 5000); }
+}
+
+async function moveItem(id, beforeId) {
+  try {
+    await post('/api/playlist/move', { id, before: beforeId || null });
+  } catch (e) { toast(e.message, 3500); }
+  await refreshPlaylist();
+}
+
+function listArea() { return document.querySelector('section.list'); }
+function overList(e) {
+  const r = listArea().getBoundingClientRect();
+  return e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom;
+}
+function clearDropMarks() {
+  document.querySelectorAll('.row.drop-before').forEach((n) => n.classList.remove('drop-before'));
+  $('#rows').classList.remove('drop-end');
+}
+function dropTarget(clientY) {
+  for (const row of document.querySelectorAll('#rows .row')) {
+    if (row.dataset.id === dragId) continue;
+    const box = row.getBoundingClientRect();
+    if (clientY < box.top + box.height / 2) return { before: row.dataset.id, row };
+  }
+  return { before: null, row: null };
+}
+function markDrop(e) {
+  clearDropMarks();
+  if (!overList(e)) return;
+  const target = dropTarget(e.clientY);
+  if (target.row) target.row.classList.add('drop-before'); else $('#rows').classList.add('drop-end');
+}
+const hasType = (e, type) => Array.from((e.dataTransfer && e.dataTransfer.types) || []).includes(type);
+
+document.addEventListener('dragenter', (e) => {
+  if (hasType(e, 'Files')) { e.preventDefault(); $('#dropHint').classList.remove('hidden'); }
+});
+document.addEventListener('dragover', (e) => {
+  const internal = hasType(e, ITEM_MIME);
+  const external = hasType(e, 'Files');
+  if (!internal && !external) return;
+  e.preventDefault(); // also prevents Edge from navigating to a mistakenly dropped file
+  e.dataTransfer.dropEffect = internal ? 'move' : 'copy';
+  if (external) $('#dropHint').classList.remove('hidden');
+  markDrop(e);
+});
+document.addEventListener('dragleave', (e) => {
+  if (e.relatedTarget === null) { $('#dropHint').classList.add('hidden'); clearDropMarks(); }
+});
+
+const VIDEO_NAME = /\.(mkv|mp4|m4v|avi|mov|ts|m2ts|webm|flv|wmv|mpg|mpeg)$/i;
+async function collectDropped(entries, plainFiles) {
+  const out = [];
+  let folders = 0;
+  const addFile = (f) => { if (VIDEO_NAME.test(f.name) && out.length < 1000) out.push({ name: f.name, size: f.size, modified: Math.trunc(f.lastModified) }); };
+  const walk = async (entry, depth) => {
+    if (out.length >= 1000 || depth > 6) return;
+    if (entry.isFile) addFile(await new Promise((ok, no) => entry.file(ok, no)));
+    else if (entry.isDirectory) {
+      folders++;
+      const reader = entry.createReader();
+      const children = [];
+      for (;;) {
+        const batch = await new Promise((ok, no) => reader.readEntries(ok, no));
+        if (!batch.length) break;
+        children.push(...batch);
+      }
+      // Episodes should keep natural order (E2 before E10), whatever order the browser returns.
+      children.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
+      for (const child of children) await walk(child, depth + 1);
+    }
+  };
+  if (entries.length) { for (const entry of entries) await walk(entry, 0); }
+  else plainFiles.forEach(addFile);
+  return { files: out, folders };
+}
+
+let droppedBusy = false;
+async function addDropped(entries, plainFiles, beforeId) {
+  if (droppedBusy) { toast('กำลังเพิ่มไฟล์จากการวางก่อนหน้า กรุณารอสักครู่'); return; }
+  droppedBusy = true;
+  try {
+    const { files } = await collectDropped(entries, plainFiles);
+    if (!files.length) { toast('ไม่พบไฟล์วิดีโอที่รองรับในสิ่งที่วาง'); return; }
+    toast(`กำลังหาตำแหน่งไฟล์ ${files.length} รายการ…`, 30000);
+    const res = await post('/api/add_dropped', { files, before: beforeId || null });
+    await refreshPlaylist();
+    const names = (res.missing || []).slice(0, 2).join(', ');
+    let msg = `เพิ่ม ${res.added} ไฟล์`;
+    if (res.skipped) msg += ` · ข้ามซ้ำ ${res.skipped}`;
+    if ((res.missing || []).length) msg += ` · หาไม่พบ ${res.missing.length} (${names}${res.missing.length > 2 ? '…' : ''}) ลองปุ่ม ＋ ไฟล์`;
+    if (res.timed_out) msg += ' · ค้นหาหมดเวลา';
+    toast(msg, 6500);
+  } catch (e) { toast('เพิ่มจากการวางไม่สำเร็จ: ' + e.message, 6500); }
+  finally { droppedBusy = false; }
+}
+
+document.addEventListener('drop', (e) => {
+  const internal = hasType(e, ITEM_MIME);
+  const external = hasType(e, 'Files');
+  if (!internal && !external) return;
+  e.preventDefault();
+  $('#dropHint').classList.add('hidden');
+  const target = overList(e) ? dropTarget(e.clientY) : { before: null };
+  clearDropMarks();
+  if (internal) {
+    const id = e.dataTransfer.getData(ITEM_MIME) || dragId;
+    if (id && overList(e)) moveItem(id, target.before);
+    return;
+  }
+  // DataTransfer objects expire after this handler returns: read them now.
+  const entries = Array.from(e.dataTransfer.items || [])
+    .filter((item) => item.kind === 'file')
+    .map((item) => (item.webkitGetAsEntry ? item.webkitGetAsEntry() : null))
+    .filter(Boolean);
+  const plain = Array.from(e.dataTransfer.files || []);
+  addDropped(entries, plain, target.before);
+});
+
+document.addEventListener('keydown', (e) => {
+  const tag = (e.target.tagName || '').toLowerCase();
+  if (['input', 'select', 'textarea'].includes(tag) || !selected) return;
+  if (e.key === 'Delete') { e.preventDefault(); removeItem(selected); return; }
+  if (e.altKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+    e.preventDefault();
+    const i = items.findIndex((x) => x.id === selected);
+    const j = e.key === 'ArrowUp' ? i - 1 : i + 1;
+    if (i < 0 || j < 0 || j >= items.length) return;
+    moveItem(selected, e.key === 'ArrowUp' ? items[j].id : (items[j + 1] ? items[j + 1].id : null));
+  }
+});
+
+
+/* ------------------ remember audio/subtitle for every episode ------------------ */
+const trackName = (p) => [p.lang, p.title].filter(Boolean).join(' · ') || 'ไม่ระบุ';
+function showTrackHint(resolved) {
+  const notes = [];
+  if (audioPref && resolved.audio < 0) notes.push(`ไฟล์นี้ไม่มีเสียงที่จำไว้ (${trackName(audioPref)}) — ใช้อัตโนมัติ`);
+  if (subtitlePref && !subtitleOff && resolved.subtitle < 0) notes.push(`ไฟล์นี้ไม่มีซับที่จำไว้ (${trackName(subtitlePref)}) — ปิดซับ`);
+  if (!notes.length && (audioPref || subtitlePref || subtitleOff)) notes.push('จำค่าเสียง/ซับ/ความเร็วนี้ไว้ใช้กับตอนถัดไปแล้ว');
+  $('#trackHint').textContent = notes.join(' · ');
+}
+function trackPref(list, track) {
+  return {
+    lang: track.lang || '', title: track.title || '', codec: track.codec || '', channels: track.channels || 0,
+    nth: list.slice(0, track.n).filter((x) => (x.lang || '') === (track.lang || '')).length,
+  };
+}
+function rememberAudio() {
+  const n = parseInt($('#selAudio').value, 10);
+  const track = loadedTracks.audio[n];
+  audioPref = n >= 0 && track ? trackPref(loadedTracks.audio, track) : null;
+}
+function rememberSubtitle() {
+  const n = parseInt($('#selSubs').value, 10);
+  const track = loadedTracks.subtitles[n];
+  if (n >= 0 && track) { subtitlePref = trackPref(loadedTracks.subtitles, track); subtitleOff = false; }
+  else { subtitlePref = null; subtitleOff = true; }
+  $('#sSubRender').checked = n >= 0;
+}
+$('#selAudio').addEventListener('change', () => { rememberAudio(); showTrackHint({ audio: parseInt($('#selAudio').value, 10), subtitle: parseInt($('#selSubs').value, 10) }); scheduleSave(); });
+$('#selSubs').addEventListener('change', () => { rememberSubtitle(); showTrackHint({ audio: parseInt($('#selAudio').value, 10), subtitle: parseInt($('#selSubs').value, 10) }); scheduleSave(); });
+$('#sSubRender').addEventListener('change', () => {
+  if (!$('#sSubRender').checked) { $('#selSubs').value = '-1'; rememberSubtitle(); scheduleSave(); }
 });

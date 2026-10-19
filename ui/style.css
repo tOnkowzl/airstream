@@ -182,3 +182,20 @@ button.wide:hover{background:rgba(255,255,255,.1)}
 .rate-btn:disabled{opacity:.4;cursor:not-allowed}.rate-btn:focus-visible{outline:2px solid #c4b5fd;outline-offset:3px}.rate-status{font-size:11px;max-width:210px}
 
 .playback-speed{flex-direction:column;gap:7px}.rate-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:6px;width:min(100%,340px)}.rate-grid .rate-btn{padding:7px 4px}.rate-status{max-width:100%;text-align:center}
+
+/* playlist drag, drop and remove */
+.row{position:relative}
+.row .grip{flex:none;width:12px;color:var(--mute);opacity:.45;font-size:13px;line-height:1;letter-spacing:-2px;cursor:grab;user-select:none}
+.row:hover .grip{opacity:.9}
+.row.dragging{opacity:.38;cursor:grabbing}
+.row.drop-before::before,.rows.drop-end::after{content:"";position:absolute;left:8px;right:8px;top:-3px;height:3px;border-radius:3px;background:var(--accent);box-shadow:0 0 10px var(--accent);pointer-events:none}
+.rows{position:relative}.rows.drop-end::after{top:auto;bottom:2px}
+.row .rowdel{flex:none;width:28px;height:28px;border:none;border-radius:8px;background:transparent;color:var(--mute);font-size:15px;line-height:1;cursor:pointer;opacity:.55;transition:.15s}
+.row:hover .rowdel,.row.sel .rowdel,.row .rowdel:focus-visible{opacity:1}
+.row .rowdel:hover,.row .rowdel:focus-visible{background:rgba(248,113,113,.18);color:#ff9a9a;outline:none}
+.rows.noanim .row{animation:none}
+.drop-hint{position:fixed;inset:10px;z-index:80;display:flex;align-items:flex-end;justify-content:center;padding-bottom:28px;border:2px dashed var(--accent);border-radius:20px;background:rgba(20,16,32,.28);pointer-events:none;font-size:16px;font-weight:700;color:#f1e6ff}
+.drop-hint>div{padding:10px 20px;border-radius:999px;background:rgba(40,28,64,.92);border:1px solid var(--accent)}
+.drop-hint.hidden{display:none}
+
+.track-hint{min-height:16px;margin:-4px 2px 10px;font-size:11.5px;color:var(--mute);line-height:1.4}
