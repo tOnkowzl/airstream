@@ -376,7 +376,7 @@ async function pollPosition() {
     // Keep `position` current even when the TV went away (switched off), so
     // Play starts a fresh Cast with the saved resume point instead of sending
     // pause/play to a dead session.
-    if (p.state === 'NO_DEVICE') { position = p; $('#btnDevices').classList.remove('connected'); $('#tState').textContent = 'NO DEVICE'; $('#tState').className = 'state'; $('#iconPlay').style.display = ''; $('#iconPause').style.display = 'none'; return; }
+    if (p.state === 'NO_DEVICE') { position = p; $('#btnDevices').classList.remove('connected'); $('#tState').textContent = 'ยังไม่เชื่อมทีวี'; $('#tState').className = 'state'; $('#iconPlay').style.display = ''; $('#iconPause').style.display = 'none'; return; }
     position = p;
     $('#btnDevices').classList.toggle('connected', p.via === 'cast' && LIVE_STATES.includes((p.state || '').toUpperCase()));
     const total = p.duration > 0 ? p.duration : (items.find((i) => i.id === selected)?.duration || 0);
