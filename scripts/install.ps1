@@ -15,6 +15,7 @@ foreach ($name in @('ffmpeg.exe','ffprobe.exe')) {
     if (-not (Test-Path -LiteralPath (Join-Path $MediaToolsDirectory $name))) { throw "Missing $name" }
 }
 Get-CimInstance Win32_Process -Filter "name='airstream.exe'" | Where-Object { $_.ExecutablePath -eq $target -or $_.ExecutablePath -eq (Join-Path ([Environment]::GetFolderPath('Desktop')) 'airstream.exe') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Get-Process -Name airstream -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $target } | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Path $install -Force | Out-Null
 if ($source -ne $target) { Copy-Item -LiteralPath $source -Destination $target -Force }
 foreach ($name in @('ffmpeg.exe','ffprobe.exe')) {
