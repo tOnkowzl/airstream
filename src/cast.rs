@@ -264,13 +264,21 @@ pub async fn connect(host: &str, port: u16, device_name: &str) -> Result<CastCli
         let mut buf: Vec<u8> = Vec::new();
         let mut pending_launch = false;
         let mut launched = false;
+        // A TV that is switched off never sends FIN: detect the half-open
+        // socket by silence (receiver answers PING/GET_STATUS within ~1 s).
+        let mut silent = 0u32;
         loop {
             let mut chunk = [0u8; 8192];
-            let n = match tokio::time::timeout(Duration::from_secs(60), rd.read(&mut chunk)).await {
+            let n = match tokio::time::timeout(Duration::from_secs(5), rd.read(&mut chunk)).await {
                 Ok(Ok(0)) => break,
-                Ok(Ok(n)) => n,
+                Ok(Ok(n)) => { silent = 0; n }
                 Ok(Err(_)) => break,
                 Err(_) => {
+                    silent += 1;
+                    if silent >= 3 {
+                        tracing::warn!("cast receiver silent for 15 s; treating connection as lost");
+                        break;
+                    }
                     // idle: ping to keep the channel alive
                     let _ = tx_reader.send(Cmd::Send(
                         NS_HEARTBEAT.into(),

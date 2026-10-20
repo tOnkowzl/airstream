@@ -115,6 +115,26 @@ pub struct MediaInfo {
 }
 
 pub fn probe(path: &str) -> MediaInfo {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    type Key = (String, u64, Option<std::time::SystemTime>);
+    type Entry = Arc<OnceLock<MediaInfo>>;
+    static CACHE: OnceLock<Mutex<HashMap<Key, Entry>>> = OnceLock::new();
+    let Ok(meta) = std::fs::metadata(path) else { return probe_uncached(path); };
+    let key = (path.to_string(), meta.len(), meta.modified().ok());
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let entry = {
+        let mut map = cache.lock().unwrap();
+        if map.len() >= 64 && !map.contains_key(&key) { map.clear(); }
+        map.entry(key.clone()).or_default().clone()
+    };
+    // Single-flight per source, not a global lock during expensive ffprobe IO.
+    let info = entry.get_or_init(|| probe_uncached(path)).clone();
+    if info.vcodec.is_empty() { cache.lock().unwrap().remove(&key); }
+    info
+}
+
+fn probe_uncached(path: &str) -> MediaInfo {
     let out = crate::process::command("ffprobe")
         .args([
             "-v",

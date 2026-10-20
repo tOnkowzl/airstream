@@ -51,6 +51,9 @@ pub struct AppState {
     pub cast: Mutex<Option<Arc<crate::cast::CastClient>>>,
     /// Prepared (faststart) MP4 files: cast targets that support exact seeking.
     pub prep: Mutex<std::collections::HashMap<String, PrepState>>,
+    pub prep_keys: Mutex<std::collections::HashMap<String, String>>,
+    /// The one speculative (pre-Play) preparation; replaced or promoted on demand.
+    pub bg_prepare: Mutex<Option<(String, tokio::task::AbortHandle)>>,
     pub subtitle_fetches: std::sync::atomic::AtomicU64,
     /// Only one filesystem search for dropped files runs at a time.
     pub drop_scan: tokio::sync::Mutex<()>,
@@ -91,6 +94,8 @@ impl AppState {
             now: Mutex::new(NowPlaying::default()),
             cast: Mutex::new(None),
             prep: Mutex::new(std::collections::HashMap::new()),
+            prep_keys: Mutex::new(std::collections::HashMap::new()),
+            bg_prepare: Mutex::new(None),
             subtitle_fetches: std::sync::atomic::AtomicU64::new(0),
             drop_scan: tokio::sync::Mutex::new(()),
         }
@@ -183,6 +188,10 @@ fn lan_ip() -> String {
 }
 
 pub async fn serve(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error>> {
+    {
+        let st = state.clone();
+        tokio::task::spawn_blocking(move || trim_prepared_cache(&st));
+    }
     let app = Router::new()
         .route("/", get(index))
         .route("/app.js", get(js))
@@ -221,11 +230,28 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error
         .route("/prepared/:id", get(prepared_media))
         .route("/stream/:id", get(stream_media))
         .route("/hls/:sid/:file", get(hls_file))
+        .layer(axum::middleware::from_fn(lan_guard))
         .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", state.port)).await?;
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
+}
+
+/// The media server must be reachable by the TV, but the control API (add
+/// files, settings, folder pickers, playlist edits) is for this PC only.
+async fn lan_guard(
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = req.uri().path();
+    let media = ["/media/", "/prepared/", "/subtitles/", "/stream/", "/hls/"].iter().any(|p| path.starts_with(p));
+    if !peer.ip().is_loopback() && !media {
+        tracing::warn!(peer = %peer, path = %path, "blocked LAN request to control API");
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    next.run(req).await
 }
 
 // ---------------------------------------------------------------- static UI
@@ -564,6 +590,7 @@ pub fn start_device_discovery(st: Arc<AppState>) {
 
 #[derive(Deserialize)]
 struct CastReq {
+    #[serde(default)]
     device: String,
     id: String,
     /// optional override: passthrough | variable-720p | variable-1080p | variable-1080p-hq
@@ -573,6 +600,12 @@ struct CastReq {
     /// pre-warm the next episode so there is no wait at the end of this one.
     #[serde(default)]
     prepare_only: bool,
+    /// Immutable UI snapshot: background preparation never changes preferences.
+    #[serde(default)]
+    settings: Option<Settings>,
+    /// Selection warm-up: cancellable when the user picks something else.
+    #[serde(default)]
+    speculative: bool,
     /// Ignore the saved stop position and play from 0:00.
     #[serde(default)]
     from_start: bool,
@@ -583,7 +616,8 @@ async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> 
     let Some(item) = st.find_item(&req.id) else {
         return (StatusCode::NOT_FOUND, Json(json!({"error":"item not found"}))).into_response();
     };
-    let Some(device) = st.device_by_id(&req.device) else {
+    let device = st.device_by_id(&req.device);
+    if device.is_none() && !req.prepare_only {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error":"unknown device — refresh the device list"})),
@@ -591,7 +625,7 @@ async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> 
             .into_response();
     };
 
-    let settings = st.settings();
+    let settings = if req.prepare_only { req.settings.unwrap_or_else(|| st.settings()) } else { st.settings() };
     let quality = Quality::parse(req.quality.as_deref().unwrap_or(&settings.quality));
 
     let path = item.path.clone();
@@ -624,7 +658,7 @@ async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> 
             return (StatusCode::UNSUPPORTED_MEDIA_TYPE, Json(json!({"error": format!("Original {} audio is not supported in this MP4 path. No AAC conversion or channel downmix was performed; choose a compatible original audio track.", audio.codec)}))).into_response();
         }
     }
-    if native && subtitle_track >= 0 && device.kind != "cast" {
+    if native && subtitle_track >= 0 && !req.prepare_only && device.as_ref().is_some_and(|d| d.kind != "cast") {
         return (StatusCode::UNSUPPORTED_MEDIA_TYPE, Json(json!({"error":"Separate subtitles are currently supported for Google Cast only. Refusing to silently omit selected subtitles."}))).into_response();
     }
     let render_subtitle = if native { -1 } else { subtitle_track };
@@ -665,9 +699,11 @@ async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> 
                 audio_track,
                 render_subtitle,
                 settings.subtitle_scale,
+                req.prepare_only && req.speculative,
             );
             return Json(json!({
                 "preparing": true,
+                "key": cache_key,
                 "progress": 0.0,
                 "message": "กำลังเตรียมไฟล์ให้ทีวี (ครั้งแรกเท่านั้น)",
                 "quality": quality.label(),
@@ -690,8 +726,9 @@ async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> 
     };
 
     if req.prepare_only {
-        return Json(json!({ "ready": true, "prepared": true })).into_response();
+        return Json(json!({ "ready": true, "prepared": true, "key": cache_key, "url": url })).into_response();
     }
+    let device = device.expect("playback device validated before preparation");
 
     // Continue where the user stopped (not for a nearly-finished item).
     let start_at = if settings.resume && !req.from_start && device.kind == "cast"
@@ -897,19 +934,32 @@ fn start_prepare(
     audio_track: i32,
     sub_track: i32,
     sub_scale: f64,
+    background: bool,
 ) {
     {
-        let prep = st.prep.lock().unwrap();
-        if let Some(p) = prep.get(item_id) {
+        st.prep_keys.lock().unwrap().insert(item_id.to_string(), cache_key.to_string());
+        // Only one speculative job: a new selection or a real Cast of another
+        // file cancels it; a real Cast of the same file promotes it.
+        let mut bg = st.bg_prepare.lock().unwrap();
+        if let Some((key, handle)) = bg.as_ref() {
+            if key == cache_key {
+                if !background { *bg = None; }
+            } else {
+                handle.abort();
+                tracing::info!(key = %key, "speculative prepare cancelled");
+                st.prep.lock().unwrap().remove(key);
+                let _ = std::fs::remove_file(prepared_path(key).with_extension("part.mp4"));
+                *bg = None;
+            }
+        }
+        let mut prep = st.prep.lock().unwrap();
+        if let Some(p) = prep.get(cache_key) {
             if p.state == "preparing" {
                 return;
             }
         }
-    }
-    {
-        let mut prep = st.prep.lock().unwrap();
         prep.insert(
-            item_id.to_string(),
+            cache_key.to_string(),
             PrepState {
                 state: "preparing".into(),
                 progress: 0.0,
@@ -925,10 +975,14 @@ fn start_prepare(
     let path = path.to_string();
     let vcodec = vcodec.to_string();
     let encoder = encoder.to_string();
-    tokio::spawn(async move {
+    let bg_key = cache_key.clone();
+    let task = tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        tracing::info!(item = %item_id, key = %cache_key, background, "prepare started");
         let out = prepared_path(&cache_key);
         let tmp = out.with_extension("part.mp4");
         let mut cmd = crate::process::async_command("ffmpeg");
+        cmd.kill_on_drop(true);
         cmd.arg("-hide_banner").args(["-loglevel", "info", "-nostdin", "-y"]);
         cmd.arg("-i").arg(&path).args(["-map", "0:v:0"]);
         let audio_n = audio_track;
@@ -949,6 +1003,7 @@ fn start_prepare(
         let subtitle_file = format!("{cache_key}.ass");
         if sub_track >= 0 {
             let extraction = crate::process::async_command("ffmpeg")
+                .kill_on_drop(true)
                 .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i"])
                 .arg(&path).args(["-map", &format!("0:s:{sub_track}"), "-c:s", "ass"])
                 .arg(prepared_dir().join(&subtitle_file)).output().await;
@@ -958,7 +1013,8 @@ fn start_prepare(
                 Err(e) => Some(e.to_string()),
             };
             if let Some(error) = error {
-                if let Some(p) = st2.prep.lock().unwrap().get_mut(&item_id) { p.state = "error".into(); p.note = error; }
+                tracing::error!(item = %item_id, key = %cache_key, error = %error, "subtitle preparation failed");
+                if let Some(p) = st2.prep.lock().unwrap().get_mut(&cache_key) { p.state = "error".into(); p.note = error; }
                 return;
             }
         }
@@ -1008,7 +1064,7 @@ fn start_prepare(
             Ok(c) => c,
             Err(e) => {
                 st2.prep.lock().unwrap().insert(
-                    item_id.clone(),
+                    cache_key.clone(),
                     PrepState { state: "error".into(), progress: 0.0, file: String::new(), note: e.to_string() },
                 );
                 return;
@@ -1039,7 +1095,7 @@ fn start_prepare(
                             if hms.len() == 3 && duration > 0.0 {
                                 let secs = hms[0] * 3600.0 + hms[1] * 60.0 + hms[2];
                                 let pct = (secs / duration * 100.0).clamp(0.0, 100.0);
-                                if let Some(p) = st2.prep.lock().unwrap().get_mut(&item_id) {
+                                if let Some(p) = st2.prep.lock().unwrap().get_mut(&cache_key) {
                                     p.progress = pct;
                                 }
                             }
@@ -1058,30 +1114,41 @@ fn start_prepare(
         let ok = matches!(status, Ok(s) if s.success()) && tmp.exists();
         if ok {
             if let Err(e) = std::fs::rename(&tmp, &out) {
-                if let Some(p) = st2.prep.lock().unwrap().get_mut(&item_id) { p.state = "error".into(); p.note = e.to_string(); }
+                tracing::error!(item = %item_id, key = %cache_key, error = %e, "prepare publish failed");
+                if let Some(p) = st2.prep.lock().unwrap().get_mut(&cache_key) { p.state = "error".into(); p.note = e.to_string(); }
                 return;
             }
-            if let Some(p) = st2.prep.lock().unwrap().get_mut(&item_id) {
+            tracing::info!(item = %item_id, key = %cache_key, elapsed_ms = started.elapsed().as_millis() as u64, "prepare ready");
+            if let Some(p) = st2.prep.lock().unwrap().get_mut(&cache_key) {
                 p.state = "ready".into();
                 p.progress = 100.0;
             }
+            trim_prepared_cache(&st2);
         } else {
             let _ = std::fs::remove_file(&tmp);
-            if let Some(p) = st2.prep.lock().unwrap().get_mut(&item_id) {
+            tracing::error!(item = %item_id, key = %cache_key, "prepare ffmpeg failed");
+            if let Some(p) = st2.prep.lock().unwrap().get_mut(&cache_key) {
                 p.state = "error".into();
                 p.note = format!("ffmpeg failed: {}", diagnostics.chars().rev().take(2000).collect::<String>().chars().rev().collect::<String>());
             }
         }
     });
+    if background {
+        *st.bg_prepare.lock().unwrap() = Some((bg_key, task.abort_handle()));
+    }
 }
 
 async fn api_prepare_status(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> impl IntoResponse {
+    if id.len() > 128 || !id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_') {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let key = st.prep_keys.lock().unwrap().get(&id).cloned().unwrap_or(id);
     let prep = st.prep.lock().unwrap();
-    match prep.get(&id) {
+    match prep.get(&key) {
         Some(p) => Json(json!(p)).into_response(),
         None => Json(json!({
-            "state": if prepared_path(&id).exists() { "ready" } else { "idle" },
-            "progress": if prepared_path(&id).exists() { 100.0 } else { 0.0 },
+            "state": if prepared_path(&key).exists() { "ready" } else { "idle" },
+            "progress": if prepared_path(&key).exists() { 100.0 } else { 0.0 },
         }))
         .into_response(),
     }
@@ -1340,11 +1407,56 @@ async fn stream_media(
 }
 
 async fn prepared_media(State(st): State<Arc<AppState>>, Path(id): Path<String>, headers: HeaderMap) -> Response {
+    // The server listens on the LAN: only accept our own 16-hex cache keys.
+    if id.len() != 16 || !id.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let f = prepared_path(&id);
     if !f.exists() {
         return StatusCode::NOT_FOUND.into_response();
     }
+    // Recently served files are kept by the cache trimmer (LRU by mtime).
+    if let Ok(file) = std::fs::File::options().write(true).open(&f) {
+        let _ = file.set_modified(std::time::SystemTime::now());
+    }
     serve_file(f, headers).await
+}
+
+/// Keeps the app-owned prepared cache bounded. Deletes only files inside
+/// %LOCALAPPDATA%\Airstream\prepared, never source media, never the file
+/// currently playing or still being prepared.
+pub fn trim_prepared_cache(st: &AppState) {
+    const LIMIT: u64 = 30 * 1024 * 1024 * 1024;
+    let dir = prepared_dir();
+    let now_url = st.now.lock().unwrap().url.clone();
+    let busy: std::collections::HashSet<String> = st.prep.lock().unwrap().iter()
+        .filter(|(_, p)| p.state == "preparing").map(|(k, _)| k.clone()).collect();
+    let Ok(rd) = std::fs::read_dir(&dir) else { return };
+    let mut files = Vec::new();
+    let mut total = 0u64;
+    for e in rd.flatten() {
+        let p = e.path();
+        let Ok(m) = e.metadata() else { continue };
+        if !m.is_file() { continue }
+        let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let key = name.split(['.', '-']).next().unwrap_or("").to_string();
+        let age = m.modified().ok().and_then(|t| t.elapsed().ok()).unwrap_or_default();
+        // Partial output left by a crash or cancelled speculative job.
+        if name.contains(".part.") && !busy.contains(&key) && age > std::time::Duration::from_secs(600) {
+            let _ = std::fs::remove_file(&p);
+            continue;
+        }
+        total += m.len();
+        if busy.contains(&key) || (!key.is_empty() && now_url.contains(&key)) { continue }
+        files.push((m.modified().unwrap_or(std::time::UNIX_EPOCH), m.len(), p));
+    }
+    files.sort_by_key(|f| f.0);
+    let mut freed = 0u64;
+    for (_, len, p) in files {
+        if total <= LIMIT { break }
+        if std::fs::remove_file(&p).is_ok() { total -= len; freed += len; }
+    }
+    if freed > 0 { tracing::info!(freed_mb = freed / 1048576, remaining_mb = total / 1048576, "prepared cache trimmed"); }
 }
 
 async fn hls_file(

@@ -132,7 +132,7 @@ function render() {
   if (selected && !items.some((x) => x.id === selected)) selected = multi.size ? Array.from(multi).pop() : null;
   $('#plName').textContent = pl.name || 'Playlist';
   $('#plCount').textContent = String(items.length);
-  $('#footInfo').textContent = `${items.length} รายการ · ดับเบิลคลิกเพื่อ cast`;
+  $('#footInfo').textContent = `${items.length} รายการ · ดับเบิลคลิกเพื่อเล่น`;
 
   const rows = $('#rows');
   rows.innerHTML = '';
@@ -202,7 +202,7 @@ function paintSelection() {
   button.classList.toggle('hidden', multi.size < 2);
   button.textContent = `ลบที่เลือก (${multi.size})`;
   if (multi.size > 1) $('#footInfo').textContent = `เลือก ${multi.size} จาก ${items.length} รายการ · Delete เพื่อเอาออก · Esc ยกเลิก`;
-  else $('#footInfo').textContent = `${items.length} รายการ · ดับเบิลคลิกเพื่อ cast`;
+  else $('#footInfo').textContent = `${items.length} รายการ · ดับเบิลคลิกเพื่อเล่น`;
 }
 
 // Click: plain = one, Ctrl/Cmd = toggle, Shift = range from the anchor row.
@@ -240,9 +240,56 @@ function select(id) {
   const it = items.find((x) => x.id === id);
   if (it && !(STATE.now && STATE.now.item_id)) {
     $('#npTitle').textContent = it.title || it.path;
-    $('#npSub').textContent = 'พร้อม cast — กดปุ่ม Cast';
+    $('#npSub').textContent = 'กด ▶ เพื่อเล่นบนทีวี';
   }
   loadTracks(id);
+  warmSelected();
+}
+
+/* Prepare the selected file before Play with the exact audio/subtitle/quality
+   the Cast button would use. One speculative job only; the server cancels it
+   when another file is selected, and never changes the user's settings. */
+let warmTimer = null;
+function warmSelected() {
+  clearTimeout(warmTimer); clearTimeout(prepTimer); $('#prepState').textContent = '';
+  warmTimer = setTimeout(async () => {
+    const id = selected;
+    if (!id) return;
+    try {
+      await loadTracks(id);
+      if (selected !== id || tracksFor !== id) return;
+      const settings = { ...readSettings(), last_item: id };
+      showPrep(id, 'checking');
+      const r = await post('/api/cast', { device: deviceId || '', id, prepare_only: true, speculative: true, settings });
+      if (r.ready) showPrep(id, 'ready');
+      else if (r.preparing) trackPrep(id);
+    } catch (e) { showPrep(id, 'error', e.message); }
+  }, 900);
+}
+
+/* readiness line under the title: tells the user Play will be instant */
+function showPrep(id, state, extra) {
+  if (selected !== id) return;
+  const n = $('#prepState');
+  const text = { checking: 'กำลังตรวจไฟล์…', ready: 'พร้อมเล่นทันที', preparing: `กำลังเตรียมไฟล์ล่วงหน้า ${extra || ''}`.trim(), error: 'เตรียมล่วงหน้าไม่ได้ — กดเล่นเพื่อลองใหม่' }[state] || '';
+  n.textContent = text;
+  n.className = 'prep ' + state;
+  if (state === 'error' && extra) n.title = extra; else n.removeAttribute('title');
+}
+let prepTimer = null;
+function trackPrep(id) {
+  clearTimeout(prepTimer);
+  const tick = async () => {
+    if (selected !== id) return;
+    try {
+      const st = await api('/api/prepare/' + id);
+      if (st.state === 'ready') return showPrep(id, 'ready');
+      if (st.state === 'error') return showPrep(id, 'error', st.note);
+      showPrep(id, 'preparing', Math.round(st.progress || 0) + '%');
+    } catch {}
+    prepTimer = setTimeout(tick, 1500);
+  };
+  tick();
 }
 
 /* ------------------------ track pickers (from real streams) ------------------------ */
@@ -326,8 +373,12 @@ async function pollPosition() {
   try {
     const p = await api('/api/position');
     updateSpeed(p.playback_rate || 1, p.via === 'cast' && ['PLAYING','PAUSED','BUFFERING'].includes(p.state));
-    if (p.state === 'NO_DEVICE') { $('#tState').textContent = 'NO DEVICE'; $('#tState').className = 'state'; return; }
+    // Keep `position` current even when the TV went away (switched off), so
+    // Play starts a fresh Cast with the saved resume point instead of sending
+    // pause/play to a dead session.
+    if (p.state === 'NO_DEVICE') { position = p; $('#btnDevices').classList.remove('connected'); $('#tState').textContent = 'NO DEVICE'; $('#tState').className = 'state'; $('#iconPlay').style.display = ''; $('#iconPause').style.display = 'none'; return; }
     position = p;
+    $('#btnDevices').classList.toggle('connected', p.via === 'cast' && LIVE_STATES.includes((p.state || '').toUpperCase()));
     const total = p.duration > 0 ? p.duration : (items.find((i) => i.id === selected)?.duration || 0);
     const pct = total > 0 ? Math.min(100, (p.elapsed / total) * 100) : 0;
     $('#fill').style.width = pct + '%';
@@ -473,7 +524,6 @@ $('#btnPickFolder').onclick = async () => {
   await boot();
 };
 
-$('#btnNewList').onclick = () => toast('หลาย playlist จะมาในเวอร์ชันถัดไป');
 
 /* ----------------------------- devices ----------------------------- */
 function closePops() { $('#devPopup').classList.add('hidden'); $('#setPopup').classList.add('hidden'); }
@@ -521,6 +571,7 @@ $('#btnCloseSet').onclick = () => $('#setPopup').classList.add('hidden');
   .forEach((sel) => {
     const n = $(sel);
     n.addEventListener('change', scheduleSave);
+    n.addEventListener('change', warmSelected);
     if (n.type === 'range') n.addEventListener('input', () => {
       $('#sSubScale').title = '×' + n.value;
     });
@@ -575,7 +626,7 @@ function updateSpeed(rate, available) {
     b.setAttribute('aria-pressed', String(active));
     b.disabled = rateBusy;
   });
-  $('#rateStatus').textContent = rateBusy ? 'กำลังบันทึก / รอทีวียืนยัน…' : available ? `ทีวียืนยัน ×${rate}` : `พร้อมเล่น ×${preferredRate} — เลือกไว้ก่อน Cast ได้`;
+  $('#rateStatus').textContent = rateBusy ? 'กำลังบันทึก / รอทีวียืนยัน…' : available ? `ทีวียืนยัน ×${rate}` : `พร้อมเล่น ×${preferredRate} — เลือกไว้ก่อนเล่นได้`;
 }
 document.querySelectorAll('[data-playback-rate]').forEach(button => {
   button.addEventListener('click', async () => {
@@ -796,8 +847,8 @@ function rememberSubtitle() {
   else { subtitlePref = null; subtitleOff = true; }
   $('#sSubRender').checked = n >= 0;
 }
-$('#selAudio').addEventListener('change', () => { rememberAudio(); showTrackHint({ audio: parseInt($('#selAudio').value, 10), subtitle: parseInt($('#selSubs').value, 10) }); scheduleSave(); });
-$('#selSubs').addEventListener('change', () => { rememberSubtitle(); showTrackHint({ audio: parseInt($('#selAudio').value, 10), subtitle: parseInt($('#selSubs').value, 10) }); scheduleSave(); });
+$('#selAudio').addEventListener('change', () => { rememberAudio(); showTrackHint({ audio: parseInt($('#selAudio').value, 10), subtitle: parseInt($('#selSubs').value, 10) }); scheduleSave(); warmSelected(); });
+$('#selSubs').addEventListener('change', () => { rememberSubtitle(); showTrackHint({ audio: parseInt($('#selAudio').value, 10), subtitle: parseInt($('#selSubs').value, 10) }); scheduleSave(); warmSelected(); });
 $('#sSubRender').addEventListener('change', () => {
   if (!$('#sSubRender').checked) { $('#selSubs').value = '-1'; rememberSubtitle(); scheduleSave(); }
 });
@@ -908,8 +959,9 @@ async function watchPlaylistAdvance(p, st, total) {
   if (!$('#sAutoPlay').checked || advancing || p.via !== 'cast') return;
   const playingId = STATE.now && STATE.now.item_id;
   if (!playingId) return;
-  // Warm the next episode while this one is still playing (last 3 minutes).
-  if (st === 'PLAYING' && total > 0 && total - p.elapsed < 180) prewarmNext(playingId);
+  // Warm the next episode early (once this one plays steadily), so auto-next
+  // and a manual "next" both start instantly instead of waiting for a remux.
+  if (st === 'PLAYING' && p.elapsed > 20) prewarmNext(playingId);
   if (st !== 'IDLE' || p.idle_reason !== 'FINISHED') return;   // Stop/interrupt/error must not advance
   const key = `${playingId}:${p.media_session_id}`;
   if (advancedFrom.has(key)) return;

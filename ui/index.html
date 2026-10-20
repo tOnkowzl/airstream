@@ -3,43 +3,41 @@
 <head>
 <meta charset="utf-8" />
 <meta name="color-scheme" content="dark" />
-<meta name="theme-color" content="#0b0b12" />
-<style>html,body{background:#0b0b12;margin:0}</style>
+<meta name="theme-color" content="#0e0f11" />
+<style>html,body{background:#0e0f11;margin:0}</style>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Airstream</title>
 <link rel="icon" type="image/png" href="/logo.png">
 <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
-<div class="aurora"><i></i><i></i><i></i></div>
-
 <div id="app">
   <!-- ======================= top bar ======================= -->
   <header class="topbar">
-    <div class="brand"><img src="/logo.png" alt="" class="logo"><span class="bname">Air<b>stream</b></span></div>
+    <div class="brand"><img src="/logo.png" alt="" class="logo"><span class="bname">Airstream</span></div>
     <div class="top-actions">
-      <button class="pill" id="btnDevices">
+      <button class="pill" id="btnDevices" title="เลือกทีวี">
+        <span class="live-dot" aria-hidden="true"></span>
         <svg viewBox="0 0 24 24"><path d="M3 5h18v11h-8v2h5v2H6v-2h5v-2H3V5zm2 2v7h14V7H5z"/></svg>
         <span id="devName">เลือกอุปกรณ์</span>
         <svg class="chev" viewBox="0 0 24 24"><path d="M7 10l5 5 5-5z"/></svg>
       </button>
-      <button class="iconbtn" id="btnSettings" title="ตั้งค่า">
+      <button class="iconbtn" id="btnSettings" title="ตั้งค่า" aria-label="ตั้งค่า">
         <svg viewBox="0 0 24 24"><path d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm8.4 4a8.4 8.4 0 0 0-.1-1.2l2-1.5-2-3.4-2.3 1a8 8 0 0 0-2-1.2L15.6 3h-4l-.4 2.6c-.7.3-1.4.7-2 1.2l-2.3-1-2 3.4 2 1.5a8.4 8.4 0 0 0 0 2.4l-2 1.5 2 3.4 2.3-1c.6.5 1.3.9 2 1.2l.4 2.6h4l.4-2.6c.7-.3 1.4-.7 2-1.2l2.3 1 2-3.4-2-1.5c.1-.4.1-.8.1-1.2z"/></svg>
       </button>
     </div>
   </header>
 
   <main class="layout">
-    <!-- ======================= remote card ======================= -->
-    <section class="card remote">
-      <div class="art" id="art">
-        <img src="/logo.png" alt="" />
-        <span class="live" id="tState">IDLE</span>
-      </div>
-
+    <!-- ======================= now playing ======================= -->
+    <section class="panel remote" aria-label="กำลังเล่น">
       <div class="np">
-        <div class="np-title" id="npTitle">ยังไม่ได้เลือกหนัง</div>
-        <div class="np-sub" id="npSub">เลือกจาก playlist แล้วกด Cast</div>
+        <div class="np-top">
+          <span class="state" id="tState">IDLE</span>
+          <span class="prep" id="prepState" aria-live="polite"></span>
+        </div>
+        <h1 class="np-title" id="npTitle">ยังไม่ได้เลือกเรื่อง</h1>
+        <div class="np-sub" id="npSub">เลือกจากรายการทางขวา แล้วกดเล่น</div>
       </div>
 
       <div class="progress">
@@ -48,20 +46,30 @@
       </div>
 
       <div class="transport">
-        <button class="t" id="btnBack10" title="-10 วินาที">
+        <button class="t" id="btnBack10" title="ย้อน 10 วินาที" aria-label="ย้อน 10 วินาที">
           <svg viewBox="0 0 24 24"><path d="M12 5V1L7 6l5 5V7a5 5 0 1 1-5 5H5a7 7 0 1 0 7-7z"/></svg><span class="lbl">10</span>
         </button>
-        <button class="t big" id="btnPlayPause" title="เล่น / หยุดชั่วคราว">
+        <button class="t big" id="btnPlayPause" title="เล่น / หยุดชั่วคราว" aria-label="เล่น / หยุดชั่วคราว">
           <svg id="iconPlay" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
           <svg id="iconPause" viewBox="0 0 24 24" style="display:none"><path d="M7 5h4v14H7zM13 5h4v14h-4z"/></svg>
         </button>
-        <button class="t" id="btnFwd30" title="+30 วินาที">
+        <button class="t" id="btnFwd30" title="ข้าม 30 วินาที" aria-label="ข้าม 30 วินาที">
           <svg viewBox="0 0 24 24"><path d="M12 5V1l5 5-5 5V7a5 5 0 1 0 5 5h2a7 7 0 1 1-7-7z"/></svg><span class="lbl">30</span>
         </button>
       </div>
 
-      <div class="playback-speed" role="group" aria-label="ความเร็วการเล่น">
-        <span>ความเร็วการเล่น</span>
+      <div class="actions">
+        <button class="cta" id="btnCast" title="เริ่มเล่นเรื่องที่เลือกบนทีวี">
+          <svg viewBox="0 0 24 24"><path d="M2 4h20v16H2V4zm2 2v8h16V6H4zm0 10v2h4a4 4 0 0 0-4-4zm8 2h8v-2h-8v2z"/></svg>
+          <span>เล่นบนทีวี</span>
+        </button>
+        <button class="ghost" id="btnStop" title="หยุดเล่นบนทีวี">
+          <svg viewBox="0 0 24 24"><path d="M6 6h12v12H6z"/></svg><span>หยุด</span>
+        </button>
+      </div>
+
+      <div class="field playback-speed" role="group" aria-label="ความเร็วการเล่น">
+        <div class="field-head"><span class="label">ความเร็ว</span><span class="rate-status" id="rateStatus" aria-live="polite">เลือกไว้ก่อนเล่นได้</span></div>
         <div class="rate-grid">
           <button type="button" class="rate-btn active" data-playback-rate="1" aria-pressed="true">×1</button>
           <button type="button" class="rate-btn" data-playback-rate="1.25" aria-pressed="false">×1.25</button>
@@ -69,29 +77,20 @@
           <button type="button" class="rate-btn" data-playback-rate="1.75" aria-pressed="false">×1.75</button>
           <button type="button" class="rate-btn" data-playback-rate="2" aria-pressed="false">×2</button>
         </div>
-        <span class="rate-status" id="rateStatus" aria-live="polite">เลือกไว้ก่อน Cast ได้</span>
-      </div>
-      <div class="actions">
-        <button class="cta" id="btnCast" title="ส่งไปทีวี">
-          <svg viewBox="0 0 24 24"><path d="M2 4h20v16H2V4zm2 2v8h16V6H4zm0 10v2h4a4 4 0 0 0-4-4zm8 2h8v-2h-8v2z"/></svg>
-          <span>Cast ไปทีวี</span>
-        </button>
-        <button class="ghost" id="btnStop" title="หยุด">
-          <svg viewBox="0 0 24 24"><path d="M6 6h12v12H6z"/></svg><span>หยุด</span>
-        </button>
       </div>
 
-      <div class="tracks">
-        <label class="tb"><span>เสียง</span>
+      <div class="field">
+        <div class="tracks">
+        <label class="tb"><span class="label">เสียง</span>
           <select id="selAudio"><option value="-1">อัตโนมัติ (ค่าเริ่มต้นของไฟล์)</option></select>
         </label>
-        <label class="tb"><span>ซับไตเติล</span>
+        <label class="tb"><span class="label">ซับไตเติล</span>
           <select id="selSubs"><option value="-1">ปิด</option></select>
         </label>
-        <button class="apply" id="btnApplyTracks" title="ใช้ค่าที่เลือกแล้ว cast ใหม่">ใช้ทันที</button>
+        <button class="apply" id="btnApplyTracks" title="ใช้เสียง/ซับที่เลือกกับเรื่องที่กำลังเล่นทันที">ใช้ทันที</button>
+        </div>
+        <div class="track-hint" id="trackHint" aria-live="polite"></div>
       </div>
-
-      <div class="track-hint" id="trackHint" aria-live="polite"></div>
 
       <div class="chips" id="chips">
         <span class="chip" id="chipDev">no device</span>
@@ -102,14 +101,13 @@
     </section>
 
     <!-- ======================= playlist ======================= -->
-    <section class="card list">
+    <section class="panel list" aria-label="รายการ">
       <header class="list-head">
         <div class="tab"><span id="plName">Playlist</span><span class="count" id="plCount">0</span></div>
         <div class="head-actions">
-          <button class="chipbtn danger hidden" id="btnRemoveSel" type="button">ลบที่เลือก</button>
-          <button class="chipbtn" id="btnPickFiles">＋ ไฟล์</button>
-          <button class="chipbtn" id="btnPickFolder">＋ โฟลเดอร์</button>
-          <button class="chipbtn hollow" id="btnNewList">＋ New</button>
+          <button class="btn danger hidden" id="btnRemoveSel" type="button">ลบที่เลือก</button>
+          <button class="btn" id="btnPickFiles">＋ ไฟล์</button>
+          <button class="btn" id="btnPickFolder">＋ โฟลเดอร์</button>
         </div>
       </header>
       <div class="rows" id="rows"></div>
@@ -124,18 +122,18 @@
 
 <!-- ================= device popover ================= -->
 <div id="devPopup" class="popover hidden">
-  <div class="pop-head"><span>อุปกรณ์ในวง LAN</span><button class="icon" id="btnRefreshDevices" title="ค้นหาใหม่">⟳</button></div>
+  <div class="pop-head"><span>ทีวีในบ้าน</span><button class="icon" id="btnRefreshDevices" title="ค้นหาใหม่" aria-label="ค้นหาใหม่">⟳</button></div>
   <div id="devList" class="dev-list"><div class="dev-empty">กำลังค้นหา…</div></div>
   <div class="pop-foot"><code id="mediaUrl"></code></div>
 </div>
 
-<!-- ================= settings (Airflow-style) ================= -->
+<!-- ================= settings ================= -->
 <div id="setPopup" class="popover wide hidden">
-  <div class="pop-head"><span>ตั้งค่า</span><button class="icon" id="btnCloseSet">✕</button></div>
+  <div class="pop-head"><span>ตั้งค่า</span><button class="icon" id="btnCloseSet" aria-label="ปิด">✕</button></div>
   <div class="set-body">
 
     <div class="group">
-      <div class="group-title">คุณภาพ / การแปลง</div>
+      <div class="group-title">คุณภาพ</div>
       <p class="hint">แนะนำ “ต้นฉบับ + ซับแยก”: คงภาพ 10-bit และเสียงเดิม ไม่แปลงหรือลดช่องเสียงอัตโนมัติ หากทีวีไม่รองรับจะแจ้งข้อผิดพลาดแทนการลดคุณภาพ</p>
       <label class="row2">
         <span>Quality</span>
@@ -200,8 +198,8 @@
 
     <div class="group">
       <div class="group-title">การเล่น</div>
-      <label class="row2 check"><span>เล่นอัตโนมัติใน playlist</span><input type="checkbox" id="sAutoPlay" /></label>
-      <label class="row2 check"><span>จำตำแหน่งล่าสุด (resume)</span><input type="checkbox" id="sResume" /></label>
+      <label class="row2 check"><span>เล่นตอนถัดไปอัตโนมัติ</span><input type="checkbox" id="sAutoPlay" /></label>
+      <label class="row2 check"><span>เล่นต่อจากจุดที่หยุด</span><input type="checkbox" id="sResume" /></label>
     </div>
 
     <div class="group">
@@ -217,9 +215,9 @@
   </div>
 </div>
 
-<div id="dropHint" class="drop-hint hidden" aria-hidden="true"><div>วางไฟล์วิดีโอหรือโฟลเดอร์เพื่อเพิ่มลง Playlist</div></div>
+<div id="dropHint" class="drop-hint hidden" aria-hidden="true"><div>วางไฟล์วิดีโอหรือโฟลเดอร์เพื่อเพิ่มลงรายการ</div></div>
 
-<div id="toast" class="toast hidden"></div>
+<div id="toast" class="toast hidden" role="status"></div>
 <script src="/app.js"></script>
 </body>
 </html>

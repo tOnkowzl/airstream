@@ -43,6 +43,17 @@ async fn main() {
     init_logging();
     tracing::info!(version = env!("CARGO_PKG_VERSION"), pid = std::process::id(), "application launched");
 
+    // E2E/diagnostics: an isolated backend with no window (pair it with
+    // AIRSTREAM_PORT and a separate LOCALAPPDATA). It lives until terminated.
+    if std::env::var("AIRSTREAM_HEADLESS").as_deref() == Ok("1") {
+        let state = Arc::new(server::AppState::new());
+        server::start_device_discovery(state.clone());
+        server::start_resume_tracker(state.clone());
+        tracing::info!(port = state.port, "headless backend");
+        if let Err(e) = server::serve(state).await { tracing::error!("server stopped: {e}"); }
+        return;
+    }
+
     // Single instance: if Airstream is already running, just show its window.
     if let Some(port) = running_instance().await {
         open_window(&format!("http://127.0.0.1:{port}/"));
