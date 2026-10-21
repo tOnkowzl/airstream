@@ -417,8 +417,12 @@ setInterval(async () => {
 }, 5000);
 
 /* ----------------------------- cast ----------------------------- */
+let castBusy = false;
 async function castItem(id, fromStart = false) {
   if (!deviceId) { openDevices(); toast('เลือกอุปกรณ์ก่อน'); return; }
+  // Repeated clicks while the TV wakes up must not queue parallel LOADs.
+  if (castBusy) { toast('กำลังเชื่อมทีวีอยู่ รอสักครู่…'); return; }
+  castBusy = true;
   const it = items.find((x) => x.id === id);
   toast(`กำลังส่ง ${it ? it.title : ''} …`, 4000);
   try {
@@ -435,7 +439,8 @@ async function castItem(id, fromStart = false) {
       $('#npTitle').textContent = it ? it.title : '';
       $('#npSub').textContent = 'กำลังเตรียมไฟล์ให้ทีวี…';
       await waitPrepare(id, it);
-      return castItem(id, fromStart);
+      castBusy = false;
+      return await castItem(id, fromStart);
     }
     $('#npTitle').textContent = r.message ? (it ? it.title : '') : '';
     $('#npSub').textContent = `casting on ${r.device || ''}`;
@@ -451,7 +456,9 @@ async function castItem(id, fromStart = false) {
     document.querySelectorAll('.row').forEach((row) => row.classList.toggle('playing', row.dataset.id === id));
     setTimeout(pollPosition, 800);
   } catch (e) {
-    toast('Cast ไม่สำเร็จ: ' + e.message, 6000);
+    toast('เล่นไม่สำเร็จ: ' + e.message, 7000);
+  } finally {
+    castBusy = false;
   }
 }
 
@@ -476,7 +483,16 @@ $('#btnCast').onclick = () => { if (selected) castItem(selected); else toast('�
 /* ----------------------------- transport ----------------------------- */
 async function transport(action) {
   try { await post('/api/transport', { action }); setTimeout(pollPosition, 500); }
-  catch (e) { toast('คำสั่งไม่สำเร็จ: ' + e.message); }
+  catch (e) {
+    // The TV dropped the session (screensaver/sleep): Play re-casts and resumes.
+    if (/no_session/.test(e.message)) {
+      position = { ...position, state: 'IDLE' };
+      // The main button showed a stale state; the TV shows nothing, so start it.
+      if (action === 'play' || action === 'pause') { const target = (STATE.now && STATE.now.item_id) || selected; if (target) return castItem(target); }
+      return;
+    }
+    toast('คำสั่งไม่สำเร็จ: ' + e.message);
+  }
 }
 // Play with a live TV session = pause/resume. Otherwise (just reopened the app, finished,
 // stopped, TV app closed) start the selected item; saved resume position applies.

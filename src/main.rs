@@ -49,6 +49,7 @@ async fn main() {
         let state = Arc::new(server::AppState::new());
         server::start_device_discovery(state.clone());
         server::start_resume_tracker(state.clone());
+        server::start_cast_preconnect(state.clone());
         tracing::info!(port = state.port, "headless backend");
         if let Err(e) = server::serve(state).await { tracing::error!("server stopped: {e}"); }
         return;
@@ -63,6 +64,7 @@ async fn main() {
     let state = Arc::new(server::AppState::new());
     server::start_device_discovery(state.clone());
     server::start_resume_tracker(state.clone());
+    server::start_cast_preconnect(state.clone());
     let port = state.port;
     let url = format!("http://127.0.0.1:{}/", port);
 

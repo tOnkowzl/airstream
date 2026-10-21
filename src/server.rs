@@ -573,10 +573,46 @@ async fn api_devices(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     Json(json!({ "devices": list }))
 }
 
+/// Keeps a warm Cast channel to the last used TV (TCP+TLS+receiver status,
+/// attaching to a running player but never launching one), so Play only has
+/// to send LOAD. Retries quietly while the TV is off.
+pub fn start_cast_preconnect(st: Arc<AppState>) {
+    tokio::spawn(async move {
+        loop {
+            let alive = st.cast.lock().unwrap().as_ref().map(|c| c.status().connected).unwrap_or(false);
+            if !alive {
+                let last = st.settings().last_device;
+                if let Some(dev) = st.device_by_id(&last).filter(|d| d.kind == "cast") {
+                    match crate::cast::connect_opts(&dev.host, dev.port, &dev.name, false).await {
+                        Ok(c) => {
+                            let mut slot = st.cast.lock().unwrap();
+                            // Never replace a channel a Play created meanwhile.
+                            if slot.as_ref().map(|c| !c.status().connected).unwrap_or(true) {
+                                tracing::info!(device = %dev.name, "warm cast channel ready");
+                                *slot = Some(Arc::new(c));
+                            }
+                        }
+                        Err(e) => tracing::debug!(error = %e, "cast pre-connect failed"),
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    });
+}
+
 pub fn start_device_discovery(st: Arc<AppState>) {
     tokio::spawn(async move {
         loop {
-            let list = devices::discover().await;
+            let mut list = devices::discover().await;
+            // E2E hook (headless test backends): a mock Cast receiver
+            // "name|host|port" that mDNS cannot announce.
+            if let Ok(spec) = std::env::var("AIRSTREAM_TEST_CAST") {
+                let f: Vec<&str> = spec.split('|').collect();
+                if f.len() == 3 {
+                    list.push(Device { id: format!("cast:test-{}", f[0]), name: f[0].into(), kind: "cast".into(), host: f[1].into(), port: f[2].parse().unwrap_or(8009), model: "mock".into(), location: String::new(), control_url: String::new() });
+                }
+            }
             // An empty scan is authoritative for this session (no ghost TVs).
             *st.devices.lock().unwrap() = list.clone();
             if let Ok(data) = serde_json::to_vec(&list) {
@@ -737,71 +773,83 @@ async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> 
     } else { 0.0 };
 
     let msg = if device.kind == "cast" {
-        let existing = {
-            let guard = st.cast.lock().unwrap();
-            let same = st.now.lock().unwrap().device_id == device.id;
-            match (guard.as_ref(), same) {
-                (Some(c), true) if c.status().connected => Some(c.clone()),
-                _ => None,
-            }
-        };
-        let client = match existing {
-            Some(c) => c,
-            None => match crate::cast::connect(&device.host, device.port, &device.name).await {
-                Ok(c) => {
-                    let arc = Arc::new(c);
-                    *st.cast.lock().unwrap() = Some(arc.clone());
-                    arc
-                }
-                Err(e) => {
-                    return (StatusCode::BAD_GATEWAY, Json(json!({"error": e, "url": url}))).into_response()
-                }
-            },
-        };
-        // The receiver quits its app after STOP; a stale session then has no
-        // transport id. Open a fresh connection, which re-launches the player.
-        let client = if client.status().transport_id.is_empty() {
-            *st.cast.lock().unwrap() = None;
-            match crate::cast::connect(&device.host, device.port, &device.name).await {
-                Ok(c) => {
-                    let arc = Arc::new(c);
-                    *st.cast.lock().unwrap() = Some(arc.clone());
-                    arc
-                }
-                Err(e) => {
-                    return (StatusCode::BAD_GATEWAY, Json(json!({"error": e, "url": url}))).into_response()
-                }
-            }
-        } else {
-            client
-        };
-        if client.status().transport_id.is_empty() {
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({"error":"Cast receiver did not expose a transport id", "url": url})),
-            )
-                .into_response();
-        }
-        if !crate::cast::load(&client, &url, &item.title, false, native_subtitle.clone(), settings.subtitle_scale, settings.playback_rate, start_at) {
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({"error":"cast channel closed", "url": url})),
-            )
-                .into_response();
-        }
+        let t_cast = std::time::Instant::now();
+        // Two attempts: the first reuses the live/warm channel; if the TV does
+        // not answer (screensaver closed the player, TV slept and woke), the
+        // second starts from a brand-new connection. Success = a real media
+        // session in PLAYING/BUFFERING, never just "LOAD was written".
+        let mut t_ready = 0u64;
         let mut started = false;
-        for _ in 0..28 {
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            let s = client.status();
-            if s.media_session_id != 0 && s.player_state == "PLAYING" {
-                started = true;
-                break;
+        let mut accepted = false;
+        let mut last_err = String::new();
+        for attempt in 0..2 {
+            let existing = if attempt == 0 {
+                let guard = st.cast.lock().unwrap();
+                match guard.as_ref() {
+                    Some(c) if c.status().connected && c.host == device.host => Some(c.clone()),
+                    _ => None,
+                }
+            } else { None };
+            // Prove the channel answers before trusting its cached state.
+            let mut client = None;
+            if let Some(c) = existing {
+                if c.refresh(1500).await {
+                    if c.ensure_player().await { client = Some(c) }
+                } else {
+                    tracing::warn!("cast channel did not answer; reconnecting");
+                    c.close();
+                }
             }
-            if !s.last_error.is_empty() {
-                let err = s.last_error.clone();
-                return (StatusCode::BAD_GATEWAY, Json(json!({"error": err, "url": url}))).into_response();
+            if client.is_none() {
+                if let Some(old) = st.cast.lock().unwrap().take() { old.close(); }
+                match crate::cast::connect(&device.host, device.port, &device.name).await {
+                    Ok(c) => {
+                        let arc = Arc::new(c);
+                        *st.cast.lock().unwrap() = Some(arc.clone());
+                        if !arc.ensure_player().await {
+                            last_err = "TV did not open the media player".into();
+                            continue;
+                        }
+                        client = Some(arc);
+                    }
+                    Err(e) => { last_err = e; continue; }
+                }
             }
+            let client = client.unwrap();
+            t_ready = t_cast.elapsed().as_millis() as u64;
+            if !crate::cast::load(&client, &url, &item.title, false, native_subtitle.clone(), settings.subtitle_scale, settings.playback_rate, start_at) {
+                last_err = "cast channel closed".into();
+                continue;
+            }
+            let mut failed = false;
+            for i in 0..80 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let s = client.status();
+                if s.media_session_id != 0 {
+                    accepted = true;
+                    if s.player_state == "PLAYING" { started = true; break; }
+                }
+                if !s.last_error.is_empty() {
+                    let err = s.last_error.clone();
+                    return (StatusCode::BAD_GATEWAY, Json(json!({"error": err, "url": url}))).into_response();
+                }
+                // No reply at all to LOAD in 4 s: the player is gone. Retry fresh.
+                if i == 40 && !accepted { failed = true; break; }
+                if !s.connected { failed = true; break; }
+            }
+            if failed {
+                tracing::warn!(attempt, "TV did not answer LOAD; retrying on a fresh connection");
+                client.drop_player();
+                last_err = "TV did not answer".into();
+                continue;
+            }
+            break;
         }
+        if !accepted {
+            tracing::error!(error = %last_err, item = %item.id, "cast failed");
+            return (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("ทีวีไม่ตอบ ({last_err}) — ลองเปิดทีวีแล้วกดเล่นอีกครั้ง"), "url": url}))).into_response();
+        }
+        tracing::info!(player_ready_ms = t_ready, playing_ms = t_cast.elapsed().as_millis() as u64, started, item = %item.id, "cast timing");
         if started {
             format!("casting to {}", device.name)
         } else {
@@ -1163,6 +1211,12 @@ async fn api_transport(State(st): State<Arc<AppState>>, Json(req): Json<Transpor
     tracing::info!(action = %req.action, "transport request");
     let cast_opt = { st.cast.lock().unwrap().clone() };
     if let Some(client) = cast_opt {
+        let cs = client.status();
+        // No live media session (TV slept / screensaver closed the player):
+        // tell the UI so Play starts a fresh Cast with the resume point.
+        if req.action != "stop" && (!cs.connected || cs.transport_id.is_empty() || cs.media_session_id == 0 || !client.refresh(1200).await || client.status().transport_id.is_empty()) {
+            return (StatusCode::CONFLICT, Json(json!({"error":"no_session"}))).into_response();
+        }
         let ok = match req.action.as_str() {
             "play" => client.play(),
             "pause" => client.pause(),
@@ -1550,7 +1604,8 @@ async fn serve_file(path: PathBuf, headers: HeaderMap) -> Response {
     }
     use tokio::io::AsyncReadExt;
     let limited = file.take(want);
-    let body = Body::from_stream(tokio_util::io::ReaderStream::new(limited));
+    // 256 KiB chunks: the 4 KiB default capped 4K remux reads at ~60-80 MB/s.
+    let body = Body::from_stream(tokio_util::io::ReaderStream::with_capacity(limited, 256 * 1024));
     (status.0, status.1, body).into_response()
 }
 

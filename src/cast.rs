@@ -13,7 +13,7 @@
 //! STOP / SEEK and periodic GET_STATUS for the position readout.
 
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -34,6 +34,8 @@ pub struct CastStatus {
     pub current_time: f64,
     pub playback_rate: f64,
     pub status_revision: u64,
+    /// Bumped on every RECEIVER_STATUS (proves the channel is really answering).
+    pub receiver_revision: u64,
     pub last_error_request_id: u64,
     pub duration: f64,
     pub title: String,
@@ -61,6 +63,13 @@ pub struct CastClient {
     pub name: String,
     request_id: Arc<AtomicU64>,
     pub rate_lock: tokio::sync::Mutex<()>,
+    /// Receiver address this channel belongs to (reuse check).
+    pub host: String,
+    /// False for a warm pre-connection: attach to a running player but do not
+    /// launch one (no surprise Cast screen on the TV before the user presses Play).
+    auto_launch: Arc<AtomicBool>,
+    /// Set by ensure_player: allow one more LAUNCH even if one was already sent.
+    relaunch: Arc<AtomicBool>,
 }
 
 impl CastClient {
@@ -89,6 +98,8 @@ impl CastClient {
     }
     pub fn stop(&self) -> bool {
         let st = self.status();
+        // Stopped on purpose: relaunch only when Play asks again.
+        self.auto_launch.store(false, Ordering::Relaxed);
         self.send(NS_MEDIA, &st.transport_id, json!({"type":"STOP","mediaSessionId":st.media_session_id}))
     }
     pub fn seek(&self, seconds: f64) -> bool {
@@ -101,7 +112,56 @@ impl CastClient {
     }
     pub fn request_status(&self) {
         let st = self.status();
-        self.send(NS_MEDIA, &st.transport_id, json!({"type":"GET_STATUS"}));
+        // Always ask the receiver too: a TV screensaver/ambient mode closes the
+        // player app silently, and only RECEIVER_STATUS reveals that.
+        self.send(NS_RECEIVER, "receiver-0", json!({"type":"GET_STATUS","requestId":self.request_id.fetch_add(1, Ordering::Relaxed)}));
+        if !st.transport_id.is_empty() {
+            self.send(NS_MEDIA, &st.transport_id, json!({"type":"GET_STATUS"}));
+        }
+    }
+
+    /// Asks the receiver for its current app list and waits for the answer.
+    /// False = the channel is dead (TV asleep/off) even if the socket looks open.
+    pub async fn refresh(&self, timeout_ms: u64) -> bool {
+        let before = self.status().receiver_revision;
+        self.send(NS_RECEIVER, "receiver-0", json!({"type":"GET_STATUS","requestId":self.request_id.fetch_add(1, Ordering::Relaxed)}));
+        for _ in 0..(timeout_ms / 25).max(1) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let s = self.status();
+            if !s.connected { return false }
+            if s.receiver_revision > before { return true }
+        }
+        false
+    }
+
+    /// Forget the player transport (it stopped answering); the next
+    /// ensure_player() relaunches it on this channel.
+    pub fn drop_player(&self) {
+        let mut s = self.status.lock().unwrap();
+        s.transport_id.clear();
+        s.media_session_id = 0;
+        s.player_state.clear();
+    }
+
+    pub fn close(&self) {
+        let _ = self.tx.send(Cmd::Close);
+        self.status.lock().unwrap().connected = false;
+    }
+
+    /// Makes sure the media player app runs on the TV, reusing this TLS channel
+    /// (no new TCP/TLS handshake). Returns when its transport is attached.
+    pub async fn ensure_player(&self) -> bool {
+        if !self.status().transport_id.is_empty() { return true }
+        self.auto_launch.store(true, Ordering::Relaxed);
+        self.relaunch.store(true, Ordering::Relaxed);
+        self.send(NS_RECEIVER, "receiver-0", json!({"type":"GET_STATUS","requestId":self.request_id.fetch_add(1, Ordering::Relaxed)}));
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let s = self.status();
+            if !s.transport_id.is_empty() { return true }
+            if !s.connected || !s.last_error.is_empty() { return false }
+        }
+        false
     }
 }
 
@@ -196,6 +256,13 @@ fn decode_message(buf: &[u8]) -> (String, String, String) {
 // ------------------------------------------------------------------ session
 
 pub async fn connect(host: &str, port: u16, device_name: &str) -> Result<CastClient, String> {
+    connect_opts(host, port, device_name, true).await
+}
+
+/// `launch == false`: warm channel only (TCP+TLS+status); attaches to an
+/// already-running player but never starts one.
+pub async fn connect_opts(host: &str, port: u16, device_name: &str, launch: bool) -> Result<CastClient, String> {
+    let started = std::time::Instant::now();
     let tcp = tokio::time::timeout(Duration::from_secs(6), TcpStream::connect((host, port)))
         .await
         .map_err(|_| "connect timeout".to_string())?
@@ -254,7 +321,9 @@ pub async fn connect(host: &str, port: u16, device_name: &str) -> Result<CastCli
         json!({"type":"GET_STATUS","requestId":req_id.fetch_add(1, Ordering::Relaxed)}),
     ));
 
-    let client = CastClient { tx: tx.clone(), status: status.clone(), name: device_name.to_string(), request_id: req_id.clone(), rate_lock: tokio::sync::Mutex::new(()) };
+    let auto_launch = Arc::new(AtomicBool::new(launch));
+    let relaunch = Arc::new(AtomicBool::new(false));
+    let client = CastClient { tx: tx.clone(), status: status.clone(), name: device_name.to_string(), request_id: req_id.clone(), rate_lock: tokio::sync::Mutex::new(()), host: host.to_string(), auto_launch: auto_launch.clone(), relaunch: relaunch.clone() };
 
     // reader task: keeps status fresh and drives LAUNCH -> CONNECT -> LOAD
     let status_r = status.clone();
@@ -267,12 +336,13 @@ pub async fn connect(host: &str, port: u16, device_name: &str) -> Result<CastCli
         // A TV that is switched off never sends FIN: detect the half-open
         // socket by silence (receiver answers PING/GET_STATUS within ~1 s).
         let mut silent = 0u32;
+        let mut attached_at = std::time::Instant::now();
         loop {
             let mut chunk = [0u8; 8192];
             let n = match tokio::time::timeout(Duration::from_secs(5), rd.read(&mut chunk)).await {
-                Ok(Ok(0)) => break,
+                Ok(Ok(0)) => { tracing::info!("cast channel closed by the TV"); break }
                 Ok(Ok(n)) => { silent = 0; n }
-                Ok(Err(_)) => break,
+                Ok(Err(e)) => { tracing::info!(error = %e, "cast channel read error"); break }
                 Err(_) => {
                     silent += 1;
                     if silent >= 3 {
@@ -318,7 +388,27 @@ pub async fn connect(host: &str, port: u16, device_name: &str) -> Result<CastCli
                     NS_RECEIVER => {
                         let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
                         if ty == "RECEIVER_STATUS" {
+                            status_r.lock().unwrap().receiver_revision += 1;
                             // already running an app?
+                            let has_player = v.pointer("/status/applications").and_then(|a| a.as_array())
+                                .map(|apps| apps.iter().any(|a| a.get("appId").and_then(|x| x.as_str()) == Some(DMR_APP_ID)))
+                                .unwrap_or(false);
+                            // Ignore a "no player" answer that raced with our own LAUNCH (2 s after attach).
+                            if !has_player && launched && attached_at.elapsed() > Duration::from_secs(2) {
+                                tracing::info!("player closed on the TV; transport cleared");
+                                // The player was closed (STOP, TV input/app switch):
+                                // forget its transport so the next Play relaunches it.
+                                let mut s = status_r.lock().unwrap();
+                                s.transport_id.clear();
+                                s.media_session_id = 0;
+                                s.player_state.clear();
+                                drop(s);
+                                launched = false;
+                                pending_launch = false;
+                                // The TV closed it (screensaver, input switch): never relaunch on
+                                // our own, that would wake the TV. Only Play (ensure_player) does.
+                                if !relaunch.load(Ordering::Relaxed) { auto_launch.store(false, Ordering::Relaxed); }
+                            }
                             if let Some(apps) = v.pointer("/status/applications").and_then(|a| a.as_array()) {
                                 if let Some(app) = apps.iter().find(|a| {
                                     a.get("appId").and_then(|x| x.as_str()) == Some(DMR_APP_ID)
@@ -338,11 +428,13 @@ pub async fn connect(host: &str, port: u16, device_name: &str) -> Result<CastCli
                                             tid.to_string(),
                                             json!({"type":"GET_STATUS"}),
                                         ));
+                                        if !launched { attached_at = std::time::Instant::now(); tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "cast player attached"); }
                                         launched = true;
                                     }
                                 }
                             }
-                            if !launched && !pending_launch {
+                            if relaunch.swap(false, Ordering::Relaxed) && !launched { pending_launch = false; }
+                            if !launched && !pending_launch && auto_launch.load(Ordering::Relaxed) {
                                 pending_launch = true;
                                 let _ = tx_reader.send(Cmd::Send(
                                     NS_RECEIVER.into(),
@@ -436,9 +528,23 @@ pub async fn connect(host: &str, port: u16, device_name: &str) -> Result<CastCli
         status_r.lock().unwrap().connected = false;
     });
 
-    // give the handshake a moment to resolve the transport id
-    for _ in 0..32 {
-        tokio::time::sleep(Duration::from_millis(250)).await;
+    tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, launch, "cast channel open");
+    // Resolve the transport id (attach or launch). A warm pre-connection only
+    // waits for the first receiver status.
+    // A sleeping TV can accept TCP/TLS yet never answer: require a receiver
+    // status within 3 s instead of hanging the Play button.
+    let mut answered = false;
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if client.status().receiver_revision > 0 { answered = true; break; }
+    }
+    if !answered {
+        client.close();
+        return Err("TV did not answer".into());
+    }
+    let polls = if launch { 160 } else { 1 };
+    for _ in 0..polls {
+        tokio::time::sleep(Duration::from_millis(50)).await;
         if !client.status().transport_id.is_empty() {
             break;
         }
