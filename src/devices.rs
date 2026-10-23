@@ -444,3 +444,48 @@ fn parse_hms(s: &str) -> f64 {
         _ => 0.0,
     }
 }
+
+/// Can this Cast receiver play Dolby (AC-3/E-AC-3) itself? Read from the
+/// receiver's own setup endpoint (`audio.digital`): set-top boxes such as the
+/// TrueVisions HP4CE report `false` and play Dolby tracks silently.
+/// Cached per host; None = unknown (assume supported, as before).
+pub async fn cast_dolby_support(host: &str) -> Option<bool> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(v) = cache.lock().unwrap().get(host) { return Some(*v) }
+    let v = fetch_dolby(host).await;
+    if let Some(v) = v {
+        tracing::info!(host, dolby = v, "cast receiver audio capability");
+        cache.lock().unwrap().insert(host.to_string(), v);
+    }
+    v
+}
+
+async fn fetch_dolby(host: &str) -> Option<bool> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let work = async {
+        let tcp = tokio::net::TcpStream::connect((host, 8443)).await.ok()?;
+        let cx = native_tls::TlsConnector::builder().danger_accept_invalid_certs(true).danger_accept_invalid_hostnames(true).build().ok()?;
+        let mut tls = tokio_native_tls::TlsConnector::from(cx).connect(host, tcp).await.ok()?;
+        // The receiver ignores HTTP/1.0 and keeps the socket open: use 1.1
+        // and stop once the JSON body is complete.
+        let req = format!("GET /setup/eureka_info?params=audio HTTP/1.1\r\nHost: {host}:8443\r\nConnection: close\r\n\r\n");
+        tls.write_all(req.as_bytes()).await.ok()?;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let v: serde_json::Value = loop {
+            let n = tls.read(&mut chunk).await.ok()?;
+            if n == 0 { return None }
+            buf.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&buf).to_string();
+            if let Some((_, body)) = text.split_once("\r\n\r\n") {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(body.trim()) { break v }
+            }
+            if buf.len() > 65536 { return None }
+        };
+        v.pointer("/audio/digital").and_then(|x| x.as_bool())
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(3), work).await.ok().flatten()
+}

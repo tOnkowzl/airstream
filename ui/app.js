@@ -437,7 +437,7 @@ async function castItem(id, fromStart = false) {
     const r = await post('/api/cast', { device: deviceId, id, from_start: fromStart });
     if (r.preparing) {
       $('#npTitle').textContent = it ? it.title : '';
-      $('#npSub').textContent = 'กำลังเตรียมไฟล์ให้ทีวี…';
+      $('#npSub').textContent = 'กำลังเตรียมไฟล์ให้ทีวี…' + (r.audio_note ? ` (${r.audio_note})` : '');
       await waitPrepare(id, it);
       castBusy = false;
       return await castItem(id, fromStart);
@@ -451,7 +451,7 @@ async function castItem(id, fromStart = false) {
     $('#chipQuality').textContent = r.quality || '—';
     $('#chipProto').textContent = (r.url || '').includes('.m3u8') ? 'HLS (fMP4)' : 'direct play';
     $('#mediaUrl').textContent = r.url || '';
-    toast(r.resumed_from > 10 ? `ดูต่อจาก ${fmt(r.resumed_from)}` : 'ส่งขึ้นทีวีแล้ว');
+    toast((r.resumed_from > 10 ? `ดูต่อจาก ${fmt(r.resumed_from)}` : 'ส่งขึ้นทีวีแล้ว') + (r.audio_note ? ` · ${r.audio_note}` : ''), r.audio_note ? 6000 : 3000);
     STATE.now = { item_id: id, title: it ? it.title : '', device_name: r.device };
     document.querySelectorAll('.row').forEach((row) => row.classList.toggle('playing', row.dataset.id === id));
     setTimeout(pollPosition, 800);

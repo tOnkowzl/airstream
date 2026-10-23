@@ -689,17 +689,33 @@ async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> 
         return (StatusCode::UNSUPPORTED_MEDIA_TYPE, Json(json!({"error": "This source is 10/12-bit or HDR. Choose Original quality + separate subtitles; refusing precision loss or unverified HDR conversion."}))).into_response();
     }
     let audio_index = if audio_track >= 0 { audio_track as usize } else { 0 };
+    // The receiver decides what it can play: Dolby on a box that reports no
+    // Dolby support (or DTS/TrueHD/FLAC anywhere) would be silent, so convert
+    // that one audio track to AAC with the same channel count. Video stays
+    // untouched, and the conversion is shown in the UI, never hidden.
+    let cast_host = device.as_ref().filter(|d| d.kind == "cast").map(|d| d.host.clone())
+        .or_else(|| st.device_by_id(&settings.last_device).filter(|d| d.kind == "cast").map(|d| d.host));
+    let dolby_ok = match &cast_host { Some(h) => crate::devices::cast_dolby_support(h).await.unwrap_or(true), None => true };
+    let mut audio_note = String::new();
+    let mut audio_aac_channels = 0u32;
     if let Some(audio) = mi.audio_tracks.get(audio_index) {
-        if !matches!(audio.codec.as_str(), "aac" | "ac3" | "eac3" | "alac" | "mp3") {
-            return (StatusCode::UNSUPPORTED_MEDIA_TYPE, Json(json!({"error": format!("Original {} audio is not supported in this MP4 path. No AAC conversion or channel downmix was performed; choose a compatible original audio track.", audio.codec)}))).into_response();
+        let playable = match audio.codec.as_str() {
+            "aac" | "mp3" => true,
+            "ac3" | "eac3" => dolby_ok,
+            _ => false,
+        };
+        if !playable {
+            audio_aac_channels = audio.channels.clamp(1, 6);
+            audio_note = format!("เสียง {} → AAC {}ch (ทีวีเล่น {} ไม่ได้)", audio.codec.to_uppercase(), audio_aac_channels, audio.codec.to_uppercase());
         }
     }
     if native && subtitle_track >= 0 && !req.prepare_only && device.as_ref().is_some_and(|d| d.kind != "cast") {
         return (StatusCode::UNSUPPORTED_MEDIA_TYPE, Json(json!({"error":"Separate subtitles are currently supported for Google Cast only. Refusing to silently omit selected subtitles."}))).into_response();
     }
     let render_subtitle = if native { -1 } else { subtitle_track };
-    let cache_key = preparation_key(&item.path, quality, if native { "original-copy" } else { &settings.encoder }, audio_track, render_subtitle, if native { 1.0 } else { settings.subtitle_scale });
-    let direct_ok = native && native_video_ok && is_mp4 && audio_track < 0;
+    let enc_tag = format!("{}{}", if native { "original-copy" } else { settings.encoder.as_str() }, if audio_aac_channels > 0 { format!("+aac{audio_aac_channels}") } else { String::new() });
+    let cache_key = preparation_key(&item.path, quality, &enc_tag, audio_track, render_subtitle, if native { 1.0 } else { settings.subtitle_scale });
+    let direct_ok = native && native_video_ok && is_mp4 && audio_track < 0 && audio_aac_channels == 0;
     let native_subtitle = if native && subtitle_track >= 0 {
         match ensure_vtt(&item, subtitle_track).await {
             Ok(_) => {
@@ -736,10 +752,12 @@ async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> 
                 render_subtitle,
                 settings.subtitle_scale,
                 req.prepare_only && req.speculative,
+                audio_aac_channels,
             );
             return Json(json!({
                 "preparing": true,
                 "key": cache_key,
+                "audio_note": audio_note,
                 "progress": 0.0,
                 "message": "กำลังเตรียมไฟล์ให้ทีวี (ครั้งแรกเท่านั้น)",
                 "quality": quality.label(),
@@ -761,8 +779,9 @@ async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> 
         )
     };
 
+    let mode = if audio_note.is_empty() { mode } else { format!("{mode} · {audio_note}") };
     if req.prepare_only {
-        return Json(json!({ "ready": true, "prepared": true, "key": cache_key, "url": url })).into_response();
+        return Json(json!({ "ready": true, "prepared": true, "key": cache_key, "url": url, "audio_note": audio_note })).into_response();
     }
     let device = device.expect("playback device validated before preparation");
 
@@ -890,7 +909,7 @@ async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> 
 
     Json(json!({
         "ok": true, "message": msg, "url": url, "mode": mode, "quality": quality_label,
-        "device": device.name, "native_subtitles": native_subtitle.is_some(), "resumed_from": start_at,
+        "device": device.name, "native_subtitles": native_subtitle.is_some(), "resumed_from": start_at, "audio_note": audio_note,
     }))
     .into_response()
 }
@@ -983,6 +1002,7 @@ fn start_prepare(
     sub_track: i32,
     sub_scale: f64,
     background: bool,
+    audio_aac_channels: u32,
 ) {
     {
         st.prep_keys.lock().unwrap().insert(item_id.to_string(), cache_key.to_string());
@@ -1101,7 +1121,15 @@ fn start_prepare(
         }
         // No audio re-encoding/downmix. Compatibility was checked before
         // preparation; avoid probing the whole source again in the hot path.
-        cmd.args(["-c:a", "copy", "-map_metadata", "0", "-map_chapters", "0"]);
+        if audio_aac_channels > 0 {
+            // Receiver cannot decode this codec: high-bitrate AAC, same channels.
+            let rate = if audio_aac_channels >= 6 { "512k" } else if audio_aac_channels > 2 { "384k" } else { "256k" };
+            // "fast" coder: ~55x realtime vs ~9x for twoloop; transparent at these bitrates.
+            cmd.args(["-c:a", "aac", "-aac_coder", "fast", "-b:a", rate, "-ac", &audio_aac_channels.to_string()]);
+        } else {
+            cmd.args(["-c:a", "copy"]);
+        }
+        cmd.args(["-map_metadata", "0", "-map_chapters", "0"]);
         cmd.args(["-sn"])
             .args(["-movflags", "+faststart", "-f", "mp4"])
             .arg(&tmp)
