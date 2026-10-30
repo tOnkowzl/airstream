@@ -448,19 +448,57 @@ fn parse_hms(s: &str) -> f64 {
 /// Can this Cast receiver play Dolby (AC-3/E-AC-3) itself? Read from the
 /// receiver's own setup endpoint (`audio.digital`): set-top boxes such as the
 /// TrueVisions HP4CE report `false` and play Dolby tracks silently.
-/// Cached per host; None = unknown (assume supported, as before).
-pub async fn cast_dolby_support(host: &str) -> Option<bool> {
+/// The answer is persisted per receiver (keyed by device name, host as
+/// fallback) in `receiver-caps.json`, so a pre-prepare while the TV is off
+/// uses the last known value. Never known and unreachable -> false (AAC
+/// always plays). Unreachable receivers are not re-queried for 10 minutes.
+pub async fn cast_dolby_support(host: &str, name: &str) -> bool {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(v) = cache.lock().unwrap().get(host) { return Some(*v) }
-    let v = fetch_dolby(host).await;
-    if let Some(v) = v {
-        tracing::info!(host, dolby = v, "cast receiver audio capability");
-        cache.lock().unwrap().insert(host.to_string(), v);
+    use std::time::{Duration, Instant};
+    struct State { caps: HashMap<String, (bool, u64)>, live: HashMap<String, bool>, down: HashMap<String, Instant> }
+    static STATE: OnceLock<Mutex<State>> = OnceLock::new();
+    let path = crate::library::data_dir().join("receiver-caps.json");
+    let st = STATE.get_or_init(|| {
+        let mut caps = HashMap::new();
+        if let Ok(t) = std::fs::read_to_string(&path) {
+            if let Ok(v) = serde_json::from_str::<HashMap<String, (bool, u64)>>(&t) { caps = v }
+        }
+        Mutex::new(State { caps, live: HashMap::new(), down: HashMap::new() })
+    });
+    let key = if name.is_empty() { format!("host:{host}") } else { name.to_string() };
+    let hkey = format!("host:{host}");
+    {
+        let g = st.lock().unwrap();
+        if let Some(v) = g.live.get(host) { return *v }
     }
-    v
+    let recently_down = st.lock().unwrap().down.get(host).map_or(false, |t| t.elapsed() < Duration::from_secs(600));
+    let fetched = if recently_down { None } else { fetch_dolby(host).await };
+    let mut g = st.lock().unwrap();
+    if let Some(v) = fetched {
+        tracing::info!(host, name, dolby = v, "cast receiver audio capability");
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        g.live.insert(host.to_string(), v);
+        g.down.remove(host);
+        g.caps.insert(key, (v, now));
+        g.caps.insert(hkey, (v, now));
+        if let Ok(t) = serde_json::to_string_pretty(&g.caps) {
+            let _ = std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new(".")));
+            let _ = std::fs::write(&path, t);
+        }
+        return v;
+    }
+    if !recently_down { g.down.insert(host.to_string(), Instant::now()) } else { None };
+    match g.caps.get(&key).or_else(|| g.caps.get(&hkey)).copied() {
+        Some((v, at)) => {
+            tracing::info!(host, name, dolby = v, checked_at = at, "cast receiver unreachable: using persisted audio capability");
+            v
+        }
+        None => {
+            tracing::info!(host, name, "cast receiver unreachable and capability unknown: assuming no Dolby (AAC)");
+            false
+        }
+    }
 }
 
 async fn fetch_dolby(host: &str) -> Option<bool> {

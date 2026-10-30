@@ -46,6 +46,16 @@ pub struct CastStatus {
     /// Session replaced by the latest LOAD; its late status messages are ignored.
     pub stale_session_id: i64,
     pub last_error: String,
+    /// Last time the receiver reported PLAYING/BUFFERING (recovery heuristics).
+    #[serde(skip)]
+    pub last_playing_at: Option<std::time::Instant>,
+    /// Bumped each time the player app disappeared from RECEIVER_STATUS.
+    pub player_closed_seq: u64,
+    /// True when that closure came within 10 s of PLAYING (crash/drop, not screensaver).
+    pub player_closed_after_playing: bool,
+    /// When the channel was last lost (reader ended / close()).
+    #[serde(skip)]
+    pub closed_at: Option<std::time::Instant>,
     pub active_track_ids: Vec<i64>,
     pub media_tracks: Vec<Value>,
     /// last few raw channel messages, for diagnostics
@@ -145,7 +155,9 @@ impl CastClient {
 
     pub fn close(&self) {
         let _ = self.tx.send(Cmd::Close);
-        self.status.lock().unwrap().connected = false;
+        let mut s = self.status.lock().unwrap();
+        s.connected = false;
+        s.closed_at.get_or_insert_with(std::time::Instant::now);
     }
 
     /// Makes sure the media player app runs on the TV, reusing this TLS channel
@@ -399,6 +411,9 @@ pub async fn connect_opts(host: &str, port: u16, device_name: &str, launch: bool
                                 // The player was closed (STOP, TV input/app switch):
                                 // forget its transport so the next Play relaunches it.
                                 let mut s = status_r.lock().unwrap();
+                                s.player_closed_after_playing = s.last_playing_at.map(|t| t.elapsed() < Duration::from_secs(10)).unwrap_or(false);
+                                s.player_closed_seq += 1;
+                                tracing::info!(after_playing = s.player_closed_after_playing, position = s.current_time, "player close recorded");
                                 s.transport_id.clear();
                                 s.media_session_id = 0;
                                 s.player_state.clear();
@@ -491,6 +506,7 @@ pub async fn connect_opts(host: &str, port: u16, device_name: &str, launch: bool
                                 }
                                 if let Some(p) = st.get("playerState").and_then(|x| x.as_str()) {
                                     s.player_state = p.to_string();
+                                    if p == "PLAYING" || p == "BUFFERING" { s.last_playing_at = Some(std::time::Instant::now()); }
                                     if p == "IDLE" {
                                         if let Some(reason) = st.get("idleReason").and_then(|x| x.as_str()) {
                                             s.idle_reason = reason.to_string();
@@ -525,7 +541,11 @@ pub async fn connect_opts(host: &str, port: u16, device_name: &str, launch: bool
                 }
             }
         }
-        status_r.lock().unwrap().connected = false;
+        {
+            let mut s = status_r.lock().unwrap();
+            s.connected = false;
+            s.closed_at = Some(std::time::Instant::now());
+        }
     });
 
     tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, launch, "cast channel open");

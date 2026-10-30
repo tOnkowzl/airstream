@@ -2,3 +2,9 @@
 /dist
 **/*.rs.bk
 *.pdb
+e2e/.work/
+
+target-hls/
+tools/hls_proto/rust_verify/cache/
+tools/hls_proto/rust_verify/vtmp_*/
+target-fix/

@@ -57,6 +57,62 @@ pub struct AppState {
     pub subtitle_fetches: std::sync::atomic::AtomicU64,
     /// Only one filesystem search for dropped files runs at a time.
     pub drop_scan: tokio::sync::Mutex<()>,
+    /// What the user wants from the TV right now (drives automatic recovery).
+    pub intent: Mutex<Option<PlayIntent>>,
+    /// Bumped by every user-initiated cast; running recoveries abort on change.
+    pub intent_gen: std::sync::atomic::AtomicU64,
+    pub recovery: Mutex<Recovery>,
+    /// Bumped by every successful LOAD (user or recovery).
+    pub load_gen: std::sync::atomic::AtomicU64,
+    /// When we last sent a LOAD (our own relaunch/LOAD transiently shows no player).
+    pub last_load_at: Mutex<Option<std::time::Instant>>,
+    /// Number of user-initiated casts currently running (whole api_cast LOAD path).
+    pub user_cast_inflight: std::sync::atomic::AtomicU32,
+    /// Serialises connect+LOAD (user Play vs. automatic recovery).
+    pub cast_lock: tokio::sync::Mutex<()>,
+}
+
+/// Marks a user cast as in flight for its whole duration (supervisor stays hands-off).
+pub struct CastInflight(Arc<AppState>);
+impl CastInflight {
+    fn new(st: &Arc<AppState>) -> Self {
+        st.user_cast_inflight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        CastInflight(st.clone())
+    }
+}
+impl Drop for CastInflight {
+    fn drop(&mut self) { self.0.user_cast_inflight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst); }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wanted { Playing, Paused, Stopped }
+
+/// How to reload the current item after a lost TV session.
+#[derive(Clone, Debug)]
+pub struct CastPlan {
+    pub url: String,
+    pub subtitle: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PlayIntent {
+    pub item_id: String,
+    pub device_id: String,
+    pub wanted: Wanted,
+    pub last_pos: f64,
+    pub last_ok_at: std::time::Instant,
+    pub plan: CastPlan,
+    /// Status-derived updates are ignored until this moment (user just acted).
+    pub locked_until: Option<std::time::Instant>,
+    /// Last time the supervisor relaunched a crashed player (once per minute).
+    pub crash_relaunch_at: Option<std::time::Instant>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Recovery {
+    pub recovering: bool,
+    pub attempt: u32,
+    pub error: String,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -98,6 +154,13 @@ impl AppState {
             bg_prepare: Mutex::new(None),
             subtitle_fetches: std::sync::atomic::AtomicU64::new(0),
             drop_scan: tokio::sync::Mutex::new(()),
+            intent: Mutex::new(None),
+            intent_gen: std::sync::atomic::AtomicU64::new(0),
+            recovery: Mutex::new(Recovery::default()),
+            load_gen: std::sync::atomic::AtomicU64::new(0),
+            last_load_at: Mutex::new(None),
+            user_cast_inflight: std::sync::atomic::AtomicU32::new(0),
+            cast_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -122,6 +185,36 @@ impl AppState {
 
     fn device_by_id(&self, id: &str) -> Option<Device> {
         self.devices.lock().unwrap().iter().find(|d| d.id == id).cloned()
+    }
+
+    /// A user-initiated cast takes over: running recoveries abort, old error cleared.
+    fn begin_user_cast(&self) {
+        self.intent_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *self.recovery.lock().unwrap() = Recovery::default();
+    }
+
+    fn set_intent(&self, item_id: &str, device_id: &str, plan: CastPlan, pos: f64) {
+        let now = std::time::Instant::now();
+        *self.intent.lock().unwrap() = Some(PlayIntent {
+            item_id: item_id.into(), device_id: device_id.into(), wanted: Wanted::Playing,
+            last_pos: pos, last_ok_at: now, plan, locked_until: Some(now + std::time::Duration::from_secs(3)),
+            crash_relaunch_at: None,
+        });
+    }
+
+    fn clear_intent(&self) {
+        *self.intent.lock().unwrap() = None;
+    }
+
+    /// The user paused/resumed/stopped: that wish beats whatever the TV reports for a moment.
+    fn user_wants(&self, wanted: Wanted) {
+        self.intent_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(i) = self.intent.lock().unwrap().as_mut() {
+            tracing::info!(?wanted, item = %i.item_id, position = i.last_pos, "intent set by user");
+            i.wanted = wanted;
+            i.locked_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(4));
+        }
+        *self.recovery.lock().unwrap() = Recovery::default();
     }
 }
 
@@ -297,7 +390,7 @@ async fn css() -> impl IntoResponse {
 
 async fn api_state(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     let prefs = st.library.prefs.lock().unwrap().clone();
-    let now = st.now.lock().unwrap().clone();
+    let now = now_json(&st);
     Json(json!({
         "version": APP_VERSION,
         "backend": "rust",
@@ -580,7 +673,10 @@ pub fn start_cast_preconnect(st: Arc<AppState>) {
     tokio::spawn(async move {
         loop {
             let alive = st.cast.lock().unwrap().as_ref().map(|c| c.status().connected).unwrap_or(false);
-            if !alive {
+            // While the user is watching, the recovery supervisor owns reconnection
+            // (it reloads the item); a warm channel here would race with it.
+            let watching = st.intent.lock().unwrap().as_ref().is_some_and(|i| i.wanted == Wanted::Playing);
+            if !alive && !watching {
                 let last = st.settings().last_device;
                 if let Some(dev) = st.device_by_id(&last).filter(|d| d.kind == "cast") {
                     match crate::cast::connect_opts(&dev.host, dev.port, &dev.name, false).await {
@@ -647,8 +743,113 @@ struct CastReq {
     from_start: bool,
 }
 
+pub struct CastOutcome {
+    pub started: bool,
+}
+
+pub enum CastFail {
+    /// The receiver answered with an error (LOAD_FAILED ...).
+    Rejected(String),
+    /// No usable answer from the TV.
+    Unanswered(String),
+}
+
+/// Connect (reusing a live channel when it answers), make sure the player runs,
+/// LOAD the item and wait for a real media session. Shared by api_cast and the
+/// automatic recovery.
+pub async fn start_cast(
+    st: &Arc<AppState>,
+    device: &Device,
+    item: &crate::library::Item,
+    settings: &Settings,
+    plan: &CastPlan,
+    start_at: f64,
+) -> Result<CastOutcome, CastFail> {
+    let _serial = st.cast_lock.lock().await;
+    let url = &plan.url;
+    let t_cast = std::time::Instant::now();
+    // Two attempts: the first reuses the live/warm channel; if the TV does
+    // not answer (screensaver closed the player, TV slept and woke), the
+    // second starts from a brand-new connection. Success = a real media
+    // session in PLAYING/BUFFERING, never just "LOAD was written".
+    let mut t_ready = 0u64;
+    let mut started = false;
+    let mut accepted = false;
+    let mut last_err = String::new();
+    for attempt in 0..2 {
+        let existing = if attempt == 0 {
+            let guard = st.cast.lock().unwrap();
+            match guard.as_ref() {
+                Some(c) if c.status().connected && c.host == device.host => Some(c.clone()),
+                _ => None,
+            }
+        } else { None };
+        // Prove the channel answers before trusting its cached state.
+        let mut client = None;
+        if let Some(c) = existing {
+            if c.refresh(1500).await {
+                if c.ensure_player().await { client = Some(c) }
+            } else {
+                tracing::warn!("cast channel did not answer; reconnecting");
+                c.close();
+            }
+        }
+        if client.is_none() {
+            if let Some(old) = st.cast.lock().unwrap().take() { old.close(); }
+            match crate::cast::connect(&device.host, device.port, &device.name).await {
+                Ok(c) => {
+                    let arc = Arc::new(c);
+                    *st.cast.lock().unwrap() = Some(arc.clone());
+                    if !arc.ensure_player().await {
+                        last_err = "TV did not open the media player".into();
+                        continue;
+                    }
+                    client = Some(arc);
+                }
+                Err(e) => { last_err = e; continue; }
+            }
+        }
+        let client = client.unwrap();
+        t_ready = t_cast.elapsed().as_millis() as u64;
+        *st.last_load_at.lock().unwrap() = Some(std::time::Instant::now());
+        if !crate::cast::load(&client, url, &item.title, false, plan.subtitle.clone(), settings.subtitle_scale, settings.playback_rate, start_at) {
+            last_err = "cast channel closed".into();
+            continue;
+        }
+        let mut failed = false;
+        for i in 0..80 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let s = client.status();
+            if s.media_session_id != 0 {
+                accepted = true;
+                if s.player_state == "PLAYING" { started = true; break; }
+            }
+            if !s.last_error.is_empty() {
+                return Err(CastFail::Rejected(s.last_error.clone()));
+            }
+            // No reply at all to LOAD in 4 s: the player is gone. Retry fresh.
+            if i == 40 && !accepted { failed = true; break; }
+            if !s.connected { failed = true; break; }
+        }
+        if failed {
+            tracing::warn!(attempt, "TV did not answer LOAD; retrying on a fresh connection");
+            client.drop_player();
+            last_err = "TV did not answer".into();
+            continue;
+        }
+        break;
+    }
+    *st.last_load_at.lock().unwrap() = Some(std::time::Instant::now());
+    if !accepted { return Err(CastFail::Unanswered(last_err)) }
+    st.load_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    tracing::info!(player_ready_ms = t_ready, playing_ms = t_cast.elapsed().as_millis() as u64, started, item = %item.id, "cast timing");
+    Ok(CastOutcome { started })
+}
+
 async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> impl IntoResponse {
     tracing::info!(item = %req.id, device = %req.device, prepare_only = req.prepare_only, "cast request");
+    // A user Play supersedes any pending automatic recovery from the very first moment.
+    let _inflight = if req.prepare_only { None } else { st.begin_user_cast(); Some(CastInflight::new(&st)) };
     let Some(item) = st.find_item(&req.id) else {
         return (StatusCode::NOT_FOUND, Json(json!({"error":"item not found"}))).into_response();
     };
@@ -693,9 +894,9 @@ async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> 
     // Dolby support (or DTS/TrueHD/FLAC anywhere) would be silent, so convert
     // that one audio track to AAC with the same channel count. Video stays
     // untouched, and the conversion is shown in the UI, never hidden.
-    let cast_host = device.as_ref().filter(|d| d.kind == "cast").map(|d| d.host.clone())
-        .or_else(|| st.device_by_id(&settings.last_device).filter(|d| d.kind == "cast").map(|d| d.host));
-    let dolby_ok = match &cast_host { Some(h) => crate::devices::cast_dolby_support(h).await.unwrap_or(true), None => true };
+    let cast_dev = device.as_ref().filter(|d| d.kind == "cast").map(|d| (d.host.clone(), d.name.clone()))
+        .or_else(|| st.device_by_id(&settings.last_device).filter(|d| d.kind == "cast").map(|d| (d.host, d.name)));
+    let dolby_ok = match &cast_dev { Some((h, n)) => crate::devices::cast_dolby_support(h, n).await, None => true };
     let mut audio_note = String::new();
     let mut audio_aac_channels = 0u32;
     if let Some(audio) = mi.audio_tracks.get(audio_index) {
@@ -792,89 +993,24 @@ async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> 
     } else { 0.0 };
 
     let msg = if device.kind == "cast" {
-        let t_cast = std::time::Instant::now();
-        // Two attempts: the first reuses the live/warm channel; if the TV does
-        // not answer (screensaver closed the player, TV slept and woke), the
-        // second starts from a brand-new connection. Success = a real media
-        // session in PLAYING/BUFFERING, never just "LOAD was written".
-        let mut t_ready = 0u64;
-        let mut started = false;
-        let mut accepted = false;
-        let mut last_err = String::new();
-        for attempt in 0..2 {
-            let existing = if attempt == 0 {
-                let guard = st.cast.lock().unwrap();
-                match guard.as_ref() {
-                    Some(c) if c.status().connected && c.host == device.host => Some(c.clone()),
-                    _ => None,
-                }
-            } else { None };
-            // Prove the channel answers before trusting its cached state.
-            let mut client = None;
-            if let Some(c) = existing {
-                if c.refresh(1500).await {
-                    if c.ensure_player().await { client = Some(c) }
-                } else {
-                    tracing::warn!("cast channel did not answer; reconnecting");
-                    c.close();
-                }
+        st.begin_user_cast();
+        let plan = CastPlan { url: url.clone(), subtitle: native_subtitle.clone() };
+        match start_cast(&st, &device, &item, &settings, &plan, start_at).await {
+            Ok(o) => {
+                st.set_intent(&item.id, &device.id, plan, start_at);
+                if o.started { format!("casting to {}", device.name) } else { format!("sent to {} (buffering)", device.name) }
             }
-            if client.is_none() {
-                if let Some(old) = st.cast.lock().unwrap().take() { old.close(); }
-                match crate::cast::connect(&device.host, device.port, &device.name).await {
-                    Ok(c) => {
-                        let arc = Arc::new(c);
-                        *st.cast.lock().unwrap() = Some(arc.clone());
-                        if !arc.ensure_player().await {
-                            last_err = "TV did not open the media player".into();
-                            continue;
-                        }
-                        client = Some(arc);
-                    }
-                    Err(e) => { last_err = e; continue; }
-                }
+            Err(CastFail::Rejected(err)) => {
+                return (StatusCode::BAD_GATEWAY, Json(json!({"error": err, "url": url}))).into_response();
             }
-            let client = client.unwrap();
-            t_ready = t_cast.elapsed().as_millis() as u64;
-            if !crate::cast::load(&client, &url, &item.title, false, native_subtitle.clone(), settings.subtitle_scale, settings.playback_rate, start_at) {
-                last_err = "cast channel closed".into();
-                continue;
+            Err(CastFail::Unanswered(last_err)) => {
+                tracing::error!(error = %last_err, item = %item.id, "cast failed");
+                return (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("ทีวีไม่ตอบ ({last_err}) — ลองเปิดทีวีแล้วกดเล่นอีกครั้ง"), "url": url}))).into_response();
             }
-            let mut failed = false;
-            for i in 0..80 {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                let s = client.status();
-                if s.media_session_id != 0 {
-                    accepted = true;
-                    if s.player_state == "PLAYING" { started = true; break; }
-                }
-                if !s.last_error.is_empty() {
-                    let err = s.last_error.clone();
-                    return (StatusCode::BAD_GATEWAY, Json(json!({"error": err, "url": url}))).into_response();
-                }
-                // No reply at all to LOAD in 4 s: the player is gone. Retry fresh.
-                if i == 40 && !accepted { failed = true; break; }
-                if !s.connected { failed = true; break; }
-            }
-            if failed {
-                tracing::warn!(attempt, "TV did not answer LOAD; retrying on a fresh connection");
-                client.drop_player();
-                last_err = "TV did not answer".into();
-                continue;
-            }
-            break;
-        }
-        if !accepted {
-            tracing::error!(error = %last_err, item = %item.id, "cast failed");
-            return (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("ทีวีไม่ตอบ ({last_err}) — ลองเปิดทีวีแล้วกดเล่นอีกครั้ง"), "url": url}))).into_response();
-        }
-        tracing::info!(player_ready_ms = t_ready, playing_ms = t_cast.elapsed().as_millis() as u64, started, item = %item.id, "cast timing");
-        if started {
-            format!("casting to {}", device.name)
-        } else {
-            format!("sent to {} (buffering)", device.name)
         }
     } else {
+        st.begin_user_cast();
+        st.clear_intent();
         let dev = device.clone();
         let url_cast = url.clone();
         let title = item.title.clone();
@@ -1237,6 +1373,7 @@ struct TransportReq {
 
 async fn api_transport(State(st): State<Arc<AppState>>, Json(req): Json<TransportReq>) -> impl IntoResponse {
     tracing::info!(action = %req.action, "transport request");
+    if req.action == "stop" { st.user_wants(Wanted::Stopped); }
     let cast_opt = { st.cast.lock().unwrap().clone() };
     if let Some(client) = cast_opt {
         let cs = client.status();
@@ -1252,6 +1389,11 @@ async fn api_transport(State(st): State<Arc<AppState>>, Json(req): Json<Transpor
             other => return (StatusCode::BAD_REQUEST, Json(json!({"error": format!("unknown action {other}")}))).into_response(),
         };
         if ok {
+            match req.action.as_str() {
+                "pause" => st.user_wants(Wanted::Paused),
+                "play" => st.user_wants(Wanted::Playing),
+                _ => {}
+            }
             return Json(json!({ "ok": true, "via": "cast" })).into_response();
         }
     }
@@ -1315,6 +1457,7 @@ async fn api_seek(State(st): State<Arc<AppState>>, Json(req): Json<SeekReq>) -> 
     let cast_opt = { st.cast.lock().unwrap().clone() };
     if let Some(client) = cast_opt {
         if client.seek(req.seconds.max(0.0)) {
+            if let Some(i) = st.intent.lock().unwrap().as_mut() { i.last_pos = req.seconds.max(0.0); }
             return Json(json!({ "ok": true, "seconds": req.seconds, "via": "cast" })).into_response();
         }
     }
@@ -1375,8 +1518,20 @@ async fn api_position(State(st): State<Arc<AppState>>, Query(q): Query<PosQuery>
 }
 
 async fn api_now(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(now_json(&st))
+}
+
+/// NowPlaying plus the automatic-recovery fields the UI shows.
+fn now_json(st: &AppState) -> serde_json::Value {
     let now = st.now.lock().unwrap().clone();
-    Json(json!(now))
+    let rec = st.recovery.lock().unwrap().clone();
+    let mut v = json!(now);
+    if let Some(o) = v.as_object_mut() {
+        o.insert("recovering".into(), json!(rec.recovering));
+        o.insert("recover_attempt".into(), json!(rec.attempt));
+        o.insert("recover_error".into(), json!(rec.error));
+    }
+    v
 }
 
 /// Cast channel diagnostics: raw messages + resolved status.
@@ -1681,9 +1836,151 @@ pub fn start_resume_tracker(st: Arc<AppState>) {
                     tokio::time::sleep(std::time::Duration::from_millis(180)).await;
                 }
             }
+            update_intent(&st);
             save_resume_now(&st, &mut finished_for);
         }
     });
+}
+
+/// Derives the user's intent from what the TV reports (MEDIA_STATUS).
+pub fn update_intent(st: &Arc<AppState>) {
+    if st.recovery.lock().unwrap().recovering { return }
+    let Some(client) = st.cast.lock().unwrap().clone() else { return };
+    let s = client.status();
+    let mut guard = st.intent.lock().unwrap();
+    let Some(i) = guard.as_mut() else { return };
+    if i.locked_until.is_some_and(|t| std::time::Instant::now() < t) { return }
+    if !s.connected || s.media_session_id == 0 { return }
+    let now = std::time::Instant::now();
+    let new = match s.player_state.as_str() {
+        "PLAYING" | "BUFFERING" => { i.last_pos = s.current_time; i.last_ok_at = now; Wanted::Playing }
+        "PAUSED" => { i.last_pos = s.current_time; Wanted::Paused }
+        "IDLE" => Wanted::Stopped,
+        _ => return,
+    };
+    if new != i.wanted {
+        tracing::info!(from = ?i.wanted, to = ?new, state = %s.player_state, idle_reason = %s.idle_reason, position = s.current_time, "intent follows TV state");
+        i.wanted = new;
+    }
+}
+
+fn set_recovery(st: &AppState, recovering: bool, attempt: u32, error: &str) {
+    *st.recovery.lock().unwrap() = Recovery { recovering, attempt, error: error.into() };
+}
+
+/// Automatic Cast session recovery. Reconnects (and relaunches the player) when the
+/// TV link drops or the player app crashes while the user was watching. Never
+/// wakes the TV for a paused/stopped session or a screensaver-closed player.
+pub fn start_cast_supervisor(st: Arc<AppState>) {
+    tokio::spawn(async move {
+        let mut down_since: Option<std::time::Instant> = None;
+        let mut handled_close = 0u64;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            update_intent(&st);
+            let Some(intent) = st.intent.lock().unwrap().clone() else { down_since = None; continue };
+            if intent.wanted != Wanted::Playing { down_since = None; continue }
+            let client = st.cast.lock().unwrap().clone();
+            let cs = client.as_ref().map(|c| c.status());
+            let link_down = cs.as_ref().map(|s| !s.connected).unwrap_or(true);
+            if link_down {
+                let sighted = *down_since.get_or_insert_with(std::time::Instant::now);
+                // Prefer the real moment the channel dropped over when we first noticed.
+                let down_for = cs.as_ref().and_then(|s| s.closed_at).map(|t| t.elapsed()).unwrap_or_else(|| sighted.elapsed());
+                if down_for >= std::time::Duration::from_secs(5) {
+                    tracing::warn!(item = %intent.item_id, position = intent.last_pos, down_for_s = down_for.as_secs(), "cast link lost while PLAYING; recovering");
+                    recover_session(&st, "connection_lost", 3, intent.last_pos).await;
+                    down_since = None;
+                    handled_close = st.cast.lock().unwrap().as_ref().map(|c| c.status().player_closed_seq).unwrap_or(0);
+                }
+                continue;
+            }
+            down_since = None;
+            let s = cs.unwrap();
+            if s.player_closed_seq != handled_close {
+                handled_close = s.player_closed_seq;
+                if !s.transport_id.is_empty() { continue }
+                // Our own relaunch/LOAD (or a user Play in progress) transiently shows no player.
+                let recent_load = st.last_load_at.lock().unwrap().is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(3));
+                if st.user_cast_inflight.load(std::sync::atomic::Ordering::SeqCst) > 0 || recent_load {
+                    tracing::info!(inflight = st.user_cast_inflight.load(std::sync::atomic::Ordering::SeqCst), recent_load, "player close ignored: cast/LOAD in progress");
+                    continue;
+                }
+                let recent = intent.crash_relaunch_at.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(60));
+                if s.player_closed_after_playing && !recent {
+                    tracing::warn!(item = %intent.item_id, position = intent.last_pos, "player closed within 10 s of PLAYING; treating as a crash and relaunching once");
+                    if let Some(i) = st.intent.lock().unwrap().as_mut() { i.crash_relaunch_at = Some(std::time::Instant::now()); }
+                    recover_session(&st, "player_closed", 1, intent.last_pos).await;
+                    handled_close = st.cast.lock().unwrap().as_ref().map(|c| c.status().player_closed_seq).unwrap_or(0);
+                } else {
+                    tracing::info!(after_playing = s.player_closed_after_playing, recent_relaunch = recent, "player closed without recent PLAYING; staying hands-off (no relaunch)");
+                    if let Some(i) = st.intent.lock().unwrap().as_mut() { i.wanted = Wanted::Stopped; }
+                }
+            }
+        }
+    });
+}
+
+async fn recover_session(st: &Arc<AppState>, reason: &str, max_attempts: u32, lost_pos: f64) {
+    use std::sync::atomic::Ordering;
+    let gen = st.intent_gen.load(Ordering::SeqCst);
+    // Position at the moment of loss; a new LOAD resets the live value to 0, so never re-read it.
+    let start_at = (lost_pos - 3.0).max(0.0);
+    let still_wanted = |st: &AppState| {
+        st.intent_gen.load(Ordering::SeqCst) == gen
+            && st.intent.lock().unwrap().as_ref().is_some_and(|i| i.wanted == Wanted::Playing)
+    };
+    const BACKOFF: [u64; 3] = [3, 10, 30];
+    for attempt in 1..=max_attempts {
+        set_recovery(st, true, attempt, "");
+        let load_gen = st.load_gen.load(Ordering::SeqCst);
+        // Back off before each attempt (the TV may be rebooting / switching input). A closed
+        // player gets a 4 s grace: a user pressing Play meanwhile cancels the automatic relaunch.
+        let wait = if reason == "player_closed" { 4 } else { BACKOFF[(attempt as usize - 1).min(2)] };
+        tracing::info!(reason, attempt, wait_s = wait, "recovery attempt scheduled");
+        for _ in 0..(wait * 4) {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            if !still_wanted(st) { tracing::info!(reason, attempt, "recovery cancelled by user action"); return }
+        }
+        let Some(intent) = st.intent.lock().unwrap().clone() else { return };
+        // Last look before touching the TV: a newer cast (user Play in flight/finished, any other
+        // LOAD) or a session that is alive again beats the automatic recovery.
+        let live = st.cast.lock().unwrap().clone().map(|c| c.status()).is_some_and(|s|
+            s.connected && s.media_session_id != 0 && matches!(s.player_state.as_str(), "PLAYING" | "BUFFERING" | "PAUSED"));
+        if !still_wanted(st) || st.user_cast_inflight.load(Ordering::SeqCst) > 0
+            || st.load_gen.load(Ordering::SeqCst) != load_gen || live {
+            tracing::info!(reason, attempt, live, "recovery cancelled: newer cast");
+            if st.recovery.lock().unwrap().recovering { set_recovery(st, false, 0, ""); }
+            return;
+        }
+        let (Some(item), Some(device)) = (st.find_item(&intent.item_id), st.device_by_id(&intent.device_id)) else {
+            tracing::warn!(reason, attempt, "recovery impossible: item or device no longer known");
+            break;
+        };
+        tracing::info!(reason, attempt, position = start_at, item = %item.id, device = %device.name, "recovery: reconnecting and reloading");
+        let settings = st.settings();
+        match start_cast(st, &device, &item, &settings, &intent.plan, start_at).await {
+            Ok(o) => {
+                if !still_wanted(st) { tracing::info!(reason, "recovered but user changed intent meanwhile"); return }
+                tracing::info!(reason, attempt, started = o.started, position = start_at, "recovery succeeded");
+                if let Some(i) = st.intent.lock().unwrap().as_mut() {
+                    i.last_ok_at = std::time::Instant::now();
+                    i.locked_until = Some(i.last_ok_at + std::time::Duration::from_secs(3));
+                }
+                set_recovery(st, false, 0, "");
+                return;
+            }
+            Err(e) => {
+                let msg = match e { CastFail::Rejected(m) | CastFail::Unanswered(m) => m };
+                tracing::warn!(reason, attempt, error = %msg, "recovery attempt failed");
+                if !still_wanted(st) { return }
+            }
+        }
+    }
+    if !still_wanted(st) { return }
+    tracing::warn!(reason, "recovery gave up: reconnect_failed");
+    if let Some(i) = st.intent.lock().unwrap().as_mut() { i.wanted = Wanted::Stopped; }
+    set_recovery(st, false, max_attempts, "reconnect_failed");
 }
 
 pub fn save_resume_now(st: &Arc<AppState>, finished_for: &mut String) {
