@@ -1,0 +1,17 @@
+<!doctype html><meta charset=utf8><body><video id=v muted playsinline width=640 controls></video>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+<script>
+window.R={fatal:[],errors:[],frag:[],events:[]};
+const q=new URLSearchParams(location.search);
+window.start=function(url,startPosition){
+  const v=document.getElementById('v');
+  const hls=new Hls({startPosition:startPosition||-1,maxBufferLength:30});
+  window.hls=hls; window.t0=performance.now();
+  hls.on(Hls.Events.ERROR,(e,d)=>{R.errors.push(d.details+':'+d.type+(d.fatal?' FATAL':'')); if(d.fatal)R.fatal.push(d.details);});
+  hls.on(Hls.Events.FRAG_LOADED,(e,d)=>{R.frag.push([d.frag.sn,Math.round(performance.now()-t0)]);});
+  v.addEventListener('playing',()=>{if(!R.playing){R.playing=Math.round(performance.now()-t0);}});
+  v.addEventListener('loadeddata',()=>{R.loadeddata=Math.round(performance.now()-t0)});
+  hls.loadSource(url); hls.attachMedia(v);
+  hls.on(Hls.Events.MANIFEST_PARSED,()=>{v.play().catch(e=>R.errors.push('play:'+e));});
+};
+</script>

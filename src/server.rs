@@ -37,6 +37,8 @@ pub struct NowPlaying {
     pub mode: String,
     pub quality: String,
     pub hls: bool,
+    /// hls (on-demand fMP4 HLS) | mp4 (prepared) | direct
+    pub stream: String,
 }
 
 pub struct AppState {
@@ -70,6 +72,8 @@ pub struct AppState {
     pub user_cast_inflight: std::sync::atomic::AtomicU32,
     /// Serialises connect+LOAD (user Play vs. automatic recovery).
     pub cast_lock: tokio::sync::Mutex<()>,
+    /// On-demand HLS VOD sessions (instant start for Original quality).
+    pub hls: crate::hls_vod::HlsManager,
 }
 
 /// Marks a user cast as in flight for its whole duration (supervisor stays hands-off).
@@ -91,6 +95,8 @@ pub enum Wanted { Playing, Paused, Stopped }
 #[derive(Clone, Debug)]
 pub struct CastPlan {
     pub url: String,
+    /// The URL is an on-demand HLS VOD playlist (LOAD as application/x-mpegurl).
+    pub hls: bool,
     pub subtitle: Option<serde_json::Value>,
 }
 
@@ -161,6 +167,7 @@ impl AppState {
             last_load_at: Mutex::new(None),
             user_cast_inflight: std::sync::atomic::AtomicU32::new(0),
             cast_lock: tokio::sync::Mutex::new(()),
+            hls: crate::hls_vod::HlsManager::new(crate::library::data_dir().join("hls"), 8 * 1024 * 1024 * 1024),
         }
     }
 
@@ -323,6 +330,7 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error
         .route("/prepared/:id", get(prepared_media))
         .route("/stream/:id", get(stream_media))
         .route("/hls/:sid/:file", get(hls_file))
+        .route("/vod/:sid/:file", get(vod_file).options(vod_options))
         .layer(axum::middleware::from_fn(lan_guard))
         .with_state(state.clone());
 
@@ -339,7 +347,7 @@ async fn lan_guard(
     next: axum::middleware::Next,
 ) -> Response {
     let path = req.uri().path();
-    let media = ["/media/", "/prepared/", "/subtitles/", "/stream/", "/hls/"].iter().any(|p| path.starts_with(p));
+    let media = ["/media/", "/prepared/", "/subtitles/", "/stream/", "/hls/", "/vod/"].iter().any(|p| path.starts_with(p));
     if !peer.ip().is_loopback() && !media {
         tracing::warn!(peer = %peer, path = %path, "blocked LAN request to control API");
         return StatusCode::FORBIDDEN.into_response();
@@ -752,6 +760,9 @@ pub enum CastFail {
     Rejected(String),
     /// No usable answer from the TV.
     Unanswered(String),
+    /// An HLS LOAD was refused or never started playing although the TV answered:
+    /// the receiver is now remembered as not supporting our HLS.
+    HlsFailed(String),
 }
 
 /// Connect (reusing a live channel when it answers), make sure the player runs,
@@ -812,12 +823,14 @@ pub async fn start_cast(
         let client = client.unwrap();
         t_ready = t_cast.elapsed().as_millis() as u64;
         *st.last_load_at.lock().unwrap() = Some(std::time::Instant::now());
-        if !crate::cast::load(&client, url, &item.title, false, plan.subtitle.clone(), settings.subtitle_scale, settings.playback_rate, start_at) {
+        let kind = if plan.hls { crate::cast::LoadKind::HlsVod } else { crate::cast::LoadKind::Mp4 };
+        if !crate::cast::load(&client, url, &item.title, kind, plan.subtitle.clone(), settings.subtitle_scale, settings.playback_rate, start_at) {
             last_err = "cast channel closed".into();
             continue;
         }
         let mut failed = false;
-        for i in 0..80 {
+        // HLS gets 12 s to reach PLAYING (first segment may need producing); MP4 8 s as before.
+        for i in 0..(if plan.hls { 120 } else { 80 }) {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             let s = client.status();
             if s.media_session_id != 0 {
@@ -825,6 +838,11 @@ pub async fn start_cast(
                 if s.player_state == "PLAYING" { started = true; break; }
             }
             if !s.last_error.is_empty() {
+                if plan.hls {
+                    tracing::warn!(error = %s.last_error, item = %item.id, device = %device.name, "HLS LOAD rejected by receiver; remembering hls=false");
+                    crate::devices::set_cast_hls_support(&device.host, &device.name, false);
+                    return Err(CastFail::HlsFailed(s.last_error.clone()));
+                }
                 return Err(CastFail::Rejected(s.last_error.clone()));
             }
             // No reply at all to LOAD in 4 s: the player is gone. Retry fresh.
@@ -841,6 +859,17 @@ pub async fn start_cast(
     }
     *st.last_load_at.lock().unwrap() = Some(std::time::Instant::now());
     if !accepted { return Err(CastFail::Unanswered(last_err)) }
+    if plan.hls {
+        if started {
+            if crate::devices::cast_hls_support(&device.host, &device.name) != Some(true) {
+                crate::devices::set_cast_hls_support(&device.host, &device.name, true);
+            }
+        } else {
+            tracing::warn!(item = %item.id, device = %device.name, "HLS LOAD accepted but no PLAYING within 12 s; remembering hls=false");
+            crate::devices::set_cast_hls_support(&device.host, &device.name, false);
+            return Err(CastFail::HlsFailed("no PLAYING within 12 s".into()));
+        }
+    }
     st.load_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     tracing::info!(player_ready_ms = t_ready, playing_ms = t_cast.elapsed().as_millis() as u64, started, item = %item.id, "cast timing");
     Ok(CastOutcome { started })
@@ -927,103 +956,168 @@ async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> 
         }
     } else { None };
 
-    let (url, mode, quality_label) = if direct_ok {
-        (
-            format!("http://{}:{}/media/{}", st.lan_ip, st.port, item.id),
-            if native_subtitle.is_some() { "original video + original audio + separate subtitles (direct)".to_string() } else { "original video + original audio (direct)".to_string() },
-            "original".to_string(),
-        )
-    } else {
-        // Everything else is prepared once into a faststart MP4: the Cast
-        // receiver on this TV rejects live HLS, but plays MP4 with Range
-        // requests — which is also what makes exact seeking work.
-        let file = prepared_path(&cache_key);
-        if !file.exists() {
-            start_prepare(
-                &st,
-                &item.id,
-                &cache_key,
-                &item.path,
-                &mi.vcodec,
-                native_video_ok,
-                quality,
-                &settings.encoder,
-                mi.duration,
-                audio_track,
-                render_subtitle,
-                settings.subtitle_scale,
-                req.prepare_only && req.speculative,
-                audio_aac_channels,
-            );
-            return Json(json!({
-                "preparing": true,
-                "key": cache_key,
-                "audio_note": audio_note,
-                "progress": 0.0,
-                "message": "กำลังเตรียมไฟล์ให้ทีวี (ครั้งแรกเท่านั้น)",
-                "quality": quality.label(),
-            }))
-            .into_response();
+    // Receivers that play the Cast HLS flavour get an on-demand fMP4 playlist built from the
+    // untouched video: no file to prepare, playback starts at once. A plain MP4 stays direct,
+    // non-Original qualities / burned subtitles keep the prepared path, and a receiver that
+    // refused HLS before (receiver-caps.json) goes straight to the prepared MP4.
+    let is_cast_target = match &device { Some(d) => d.kind == "cast", None => cast_dev.is_some() };
+    let hls_known = cast_dev.as_ref().and_then(|(h, n)| devices::cast_hls_support(h, n));
+    let want_hls = native && native_video_ok && is_cast_target && !direct_ok && hls_known != Some(false) && settings.stream_mode != "prepare";
+    let mut hls_note = String::new();
+    let hls_sid: Option<String> = if want_hls {
+        match open_hls_session(&st, &item.path, audio_index).await {
+            Ok((sid, codec, channels, copy)) => {
+                if !copy {
+                    hls_note = if audio_note.is_empty() {
+                        format!("เสียง {} → AAC {}ch (สตรีมทันที)", codec.to_uppercase(), channels)
+                    } else { audio_note.clone() };
+                }
+                tracing::info!(item = %item.id, session = %sid, audio_copy = copy, audio_codec = %codec, receiver_hls = ?hls_known, "stream path: HLS on demand");
+                Some(sid)
+            }
+            Err(e) => {
+                tracing::warn!(item = %item.id, error = %e, "HLS session could not be opened; using prepared MP4");
+                None
+            }
         }
-        let mode = if native {
-            if subtitle_track >= 0 { "original video + original audio + separate subtitles".to_string() } else { "original video + original audio (remux)".to_string() }
-        } else if subtitle_track >= 0 {
-            "prepared with burned-in subtitles".to_string()
-        } else { match quality {
-            Quality::Passthrough => "remux (copy)".to_string(),
-            _ => format!("prepared {}", quality.label()),
-        }};
-        (
-            format!("http://{}:{}/prepared/{}", st.lan_ip, st.port, cache_key),
-            mode,
-            quality.label().to_string(),
-        )
+    } else {
+        tracing::info!(item = %item.id, native, direct_ok, cast = is_cast_target, receiver_hls = ?hls_known, stream_mode = %settings.stream_mode,
+            "stream path: {}", if direct_ok { "direct" } else { "prepared MP4" });
+        None
     };
 
-    let mode = if audio_note.is_empty() { mode } else { format!("{mode} · {audio_note}") };
-    if req.prepare_only {
-        return Json(json!({ "ready": true, "prepared": true, "key": cache_key, "url": url, "audio_note": audio_note })).into_response();
-    }
-    let device = device.expect("playback device validated before preparation");
-
     // Continue where the user stopped (not for a nearly-finished item).
-    let start_at = if settings.resume && !req.from_start && device.kind == "cast"
+    let start_at = if settings.resume && !req.from_start && is_cast_target
         && item.resume_pos > 10.0 && (mi.duration <= 0.0 || item.resume_pos < mi.duration - 30.0) {
         item.resume_pos
     } else { 0.0 };
 
-    let msg = if device.kind == "cast" {
-        st.begin_user_cast();
-        let plan = CastPlan { url: url.clone(), subtitle: native_subtitle.clone() };
-        match start_cast(&st, &device, &item, &settings, &plan, start_at).await {
-            Ok(o) => {
-                st.set_intent(&item.id, &device.id, plan, start_at);
-                if o.started { format!("casting to {}", device.name) } else { format!("sent to {} (buffering)", device.name) }
-            }
-            Err(CastFail::Rejected(err)) => {
-                return (StatusCode::BAD_GATEWAY, Json(json!({"error": err, "url": url}))).into_response();
-            }
-            Err(CastFail::Unanswered(last_err)) => {
-                tracing::error!(error = %last_err, item = %item.id, "cast failed");
-                return (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("ทีวีไม่ตอบ ({last_err}) — ลองเปิดทีวีแล้วกดเล่นอีกครั้ง"), "url": url}))).into_response();
-            }
+    if let Some(sid) = &hls_sid {
+        // Warm the first segments in the background (resume position included).
+        let mgr = st.hls.clone();
+        let (sid2, pos) = (sid.clone(), start_at);
+        tokio::spawn(async move { mgr.prefetch(&sid2, pos).await });
+        if req.prepare_only {
+            let url = format!("http://{}:{}/vod/{}/master.m3u8", st.lan_ip, st.port, sid);
+            return Json(json!({ "ready": true, "prepared": true, "stream": "hls", "key": sid, "url": url, "audio_note": hls_note })).into_response();
         }
-    } else {
-        st.begin_user_cast();
-        st.clear_intent();
-        let dev = device.clone();
-        let url_cast = url.clone();
-        let title = item.title.clone();
-        match tokio::task::spawn_blocking(move || devices::cast_dlna(&dev, &url_cast, &title))
-            .await
-            .unwrap_or_else(|e| Err(e.to_string()))
-        {
-            Ok(m) => m,
-            Err(e) => {
-                return (StatusCode::BAD_GATEWAY, Json(json!({ "error": e, "url": url }))).into_response()
+    }
+
+    let mut try_hls = hls_sid.is_some();
+    let (msg, url, mode, quality_label, stream, audio_note) = loop {
+        let (url, mode, quality_label, stream, note) = if let (true, Some(sid)) = (try_hls, &hls_sid) {
+            let audio = if hls_note.is_empty() { "original audio" } else { "AAC audio" };
+            let subs = if native_subtitle.is_some() { " + separate subtitles" } else { "" };
+            (
+                format!("http://{}:{}/vod/{}/master.m3u8", st.lan_ip, st.port, sid),
+                format!("original video + {audio}{subs} · สตรีมทันที"),
+                "original".to_string(),
+                "hls",
+                hls_note.clone(),
+            )
+        } else if direct_ok {
+            (
+                format!("http://{}:{}/media/{}", st.lan_ip, st.port, item.id),
+                if native_subtitle.is_some() { "original video + original audio + separate subtitles (direct)".to_string() } else { "original video + original audio (direct)".to_string() },
+                "original".to_string(),
+                "direct",
+                audio_note.clone(),
+            )
+        } else {
+            // Everything else is prepared once into a faststart MP4: the Cast
+            // receiver on this TV rejects live HLS, but plays MP4 with Range
+            // requests — which is also what makes exact seeking work.
+            let file = prepared_path(&cache_key);
+            if !file.exists() {
+                start_prepare(
+                    &st,
+                    &item.id,
+                    &cache_key,
+                    &item.path,
+                    &mi.vcodec,
+                    native_video_ok,
+                    quality,
+                    &settings.encoder,
+                    mi.duration,
+                    audio_track,
+                    render_subtitle,
+                    settings.subtitle_scale,
+                    req.prepare_only && req.speculative,
+                    audio_aac_channels,
+                );
+                return Json(json!({
+                    "preparing": true,
+                    "key": cache_key,
+                    "audio_note": audio_note,
+                    "progress": 0.0,
+                    "message": "กำลังเตรียมไฟล์ให้ทีวี (ครั้งแรกเท่านั้น)",
+                    "quality": quality.label(),
+                }))
+                .into_response();
             }
+            let mode = if native {
+                if subtitle_track >= 0 { "original video + original audio + separate subtitles".to_string() } else { "original video + original audio (remux)".to_string() }
+            } else if subtitle_track >= 0 {
+                "prepared with burned-in subtitles".to_string()
+            } else { match quality {
+                Quality::Passthrough => "remux (copy)".to_string(),
+                _ => format!("prepared {}", quality.label()),
+            }};
+            (
+                format!("http://{}:{}/prepared/{}", st.lan_ip, st.port, cache_key),
+                mode,
+                quality.label().to_string(),
+                "mp4",
+                audio_note.clone(),
+            )
+        };
+
+        let mode = if note.is_empty() { mode } else { format!("{mode} · {note}") };
+        if req.prepare_only {
+            return Json(json!({ "ready": true, "prepared": true, "stream": stream, "key": cache_key, "url": url, "audio_note": note })).into_response();
         }
+        let device = device.as_ref().expect("playback device validated before preparation");
+
+        let msg = if device.kind == "cast" {
+            st.begin_user_cast();
+            let plan = CastPlan { url: url.clone(), hls: stream == "hls", subtitle: native_subtitle.clone() };
+            match start_cast(&st, device, &item, &settings, &plan, start_at).await {
+                Ok(o) => {
+                    st.set_intent(&item.id, &device.id, plan, start_at);
+                    if o.started { format!("casting to {}", device.name) } else { format!("sent to {} (buffering)", device.name) }
+                }
+                Err(CastFail::HlsFailed(why)) => {
+                    tracing::warn!(item = %item.id, device = %device.name, reason = %why, "HLS fallback: using the prepared MP4 path for this and future plays");
+                    try_hls = false;
+                    continue;
+                }
+                Err(CastFail::Rejected(err)) => {
+                    return (StatusCode::BAD_GATEWAY, Json(json!({"error": err, "url": url}))).into_response();
+                }
+                Err(CastFail::Unanswered(last_err)) => {
+                    tracing::error!(error = %last_err, item = %item.id, "cast failed");
+                    return (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("ทีวีไม่ตอบ ({last_err}) — ลองเปิดทีวีแล้วกดเล่นอีกครั้ง"), "url": url}))).into_response();
+                }
+            }
+        } else {
+            st.begin_user_cast();
+            st.clear_intent();
+            let dev = device.clone();
+            let url_cast = url.clone();
+            let title = item.title.clone();
+            match tokio::task::spawn_blocking(move || devices::cast_dlna(&dev, &url_cast, &title))
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()))
+            {
+                Ok(m) => m,
+                Err(e) => {
+                    return (StatusCode::BAD_GATEWAY, Json(json!({ "error": e, "url": url }))).into_response()
+                }
+            }
+        };
+        break (msg, url, mode, quality_label, stream, note);
     };
+    let device = device.expect("playback device validated before preparation");
 
     {
         let mut now = st.now.lock().unwrap();
@@ -1035,7 +1129,8 @@ async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> 
             url: url.clone(),
             mode: mode.clone(),
             quality: quality_label.clone(),
-            hls: false,
+            hls: stream == "hls",
+            stream: stream.to_string(),
         };
     }
     let mut s = settings.clone();
@@ -1045,7 +1140,7 @@ async fn api_cast(State(st): State<Arc<AppState>>, Json(req): Json<CastReq>) -> 
 
     Json(json!({
         "ok": true, "message": msg, "url": url, "mode": mode, "quality": quality_label,
-        "device": device.name, "native_subtitles": native_subtitle.is_some(), "resumed_from": start_at, "audio_note": audio_note,
+        "device": device.name, "native_subtitles": native_subtitle.is_some(), "resumed_from": start_at, "audio_note": audio_note, "stream": stream,
     }))
     .into_response()
 }
@@ -1724,6 +1819,88 @@ async fn hls_file(
     serve_file(path, headers).await
 }
 
+// ---------------------------------------------------------------- on-demand HLS VOD
+
+/// Opens (or reuses) the HLS session for `path` with the audio track `audio_ordinal`
+/// (index among audio streams). Returns (session id, source audio codec, AAC channels, copied).
+/// AAC sources are copied; everything else becomes AAC-LC with min(6, channels).
+async fn open_hls_session(st: &AppState, path: &str, audio_ordinal: usize) -> Result<(String, String, u32, bool), String> {
+    let p = PathBuf::from(path);
+    let p2 = p.clone();
+    let basics = tokio::task::spawn_blocking(move || crate::mkv_index::probe_basic(&p2))
+        .await
+        .map_err(|e| e.to_string())??;
+    let a = basics.audio.get(audio_ordinal).ok_or_else(|| format!("audio track {audio_ordinal} not found"))?;
+    let copy = a.codec == "aac";
+    let channels = a.channels.clamp(1, 6);
+    let opts = crate::hls_vod::VodOptions {
+        audio_index: a.index,
+        audio: if copy { crate::hls_vod::AudioMode::Copy } else { crate::hls_vod::AudioMode::Aac { channels } },
+        format: crate::hls_vod::SegFormat::Fmp4,
+    };
+    let sid = st.hls.open(&p, opts).await?;
+    Ok((sid, a.codec.clone(), channels, copy))
+}
+
+fn vod_reply(code: StatusCode, ctype: &'static str, cache: &'static str, body: impl Into<Body>) -> Response {
+    (
+        code,
+        [(header::CONTENT_TYPE, ctype), (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"), (header::CACHE_CONTROL, cache)],
+        body.into(),
+    )
+        .into_response()
+}
+
+async fn vod_options() -> Response {
+    (
+        StatusCode::NO_CONTENT,
+        [(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"), (header::ACCESS_CONTROL_ALLOW_HEADERS, "*")],
+    )
+        .into_response()
+}
+
+async fn vod_file(State(st): State<Arc<AppState>>, Path((sid, file)): Path<(String, String)>, headers: HeaderMap) -> Response {
+    let t0 = std::time::Instant::now();
+    let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let r = match file.as_str() {
+        "master.m3u8" => match st.hls.master(&sid) {
+            Some(m) => vod_reply(StatusCode::OK, "application/vnd.apple.mpegurl", "no-cache", m),
+            None => vod_reply(StatusCode::NOT_FOUND, "text/plain", "no-cache", "no session"),
+        },
+        "index.m3u8" => match st.hls.playlist(&sid) {
+            Some(m) => vod_reply(StatusCode::OK, "application/vnd.apple.mpegurl", "no-cache", m),
+            None => vod_reply(StatusCode::NOT_FOUND, "text/plain", "no-cache", "no session"),
+        },
+        "init.mp4" => match st.hls.init(&sid).await {
+            Ok(p) => match tokio::fs::read(&p).await {
+                Ok(b) => vod_reply(StatusCode::OK, "video/mp4", "max-age=3600", b),
+                Err(e) => vod_reply(StatusCode::INTERNAL_SERVER_ERROR, "text/plain", "no-cache", e.to_string()),
+            },
+            Err(e) => vod_reply(StatusCode::NOT_FOUND, "text/plain", "no-cache", e),
+        },
+        name => {
+            let (stem, ext) = name.rsplit_once('.').unwrap_or((name, ""));
+            let n = stem.strip_prefix("seg").and_then(|v| v.parse::<usize>().ok());
+            let ctype = match ext { "m4s" => "video/iso.segment", "ts" => "video/mp2t", _ => "" };
+            match (n, ctype) {
+                (Some(n), c) if !c.is_empty() => match st.hls.segment(&sid, n).await {
+                    Ok(p) => match tokio::fs::read(&p).await {
+                        Ok(b) => vod_reply(StatusCode::OK, c, "max-age=3600", b),
+                        Err(e) => vod_reply(StatusCode::INTERNAL_SERVER_ERROR, "text/plain", "no-cache", e.to_string()),
+                    },
+                    Err(e) => {
+                        tracing::warn!(session = %sid, segment = n, error = %e, "vod segment failed");
+                        vod_reply(StatusCode::INTERNAL_SERVER_ERROR, "text/plain", "no-cache", e)
+                    }
+                },
+                _ => vod_reply(StatusCode::NOT_FOUND, "text/plain", "no-cache", "not found"),
+            }
+        }
+    };
+    tracing::info!(session = %sid, file = %file, status = r.status().as_u16(), ms = t0.elapsed().as_millis() as u64, ua = %ua, "GET /vod");
+    r
+}
+
 async fn serve_file(path: PathBuf, headers: HeaderMap) -> Response {
     let Ok(meta) = std::fs::metadata(&path) else {
         return StatusCode::NOT_FOUND.into_response();
@@ -1971,7 +2148,7 @@ async fn recover_session(st: &Arc<AppState>, reason: &str, max_attempts: u32, lo
                 return;
             }
             Err(e) => {
-                let msg = match e { CastFail::Rejected(m) | CastFail::Unanswered(m) => m };
+                let msg = match e { CastFail::Rejected(m) | CastFail::Unanswered(m) | CastFail::HlsFailed(m) => m };
                 tracing::warn!(reason, attempt, error = %msg, "recovery attempt failed");
                 if !still_wanted(st) { return }
             }

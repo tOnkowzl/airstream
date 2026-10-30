@@ -453,52 +453,107 @@ fn parse_hms(s: &str) -> f64 {
 /// uses the last known value. Never known and unreachable -> false (AAC
 /// always plays). Unreachable receivers are not re-queried for 10 minutes.
 pub async fn cast_dolby_support(host: &str, name: &str) -> bool {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant};
-    struct State { caps: HashMap<String, (bool, u64)>, live: HashMap<String, bool>, down: HashMap<String, Instant> }
-    static STATE: OnceLock<Mutex<State>> = OnceLock::new();
-    let path = crate::library::data_dir().join("receiver-caps.json");
-    let st = STATE.get_or_init(|| {
-        let mut caps = HashMap::new();
-        if let Ok(t) = std::fs::read_to_string(&path) {
-            if let Ok(v) = serde_json::from_str::<HashMap<String, (bool, u64)>>(&t) { caps = v }
-        }
-        Mutex::new(State { caps, live: HashMap::new(), down: HashMap::new() })
-    });
-    let key = if name.is_empty() { format!("host:{host}") } else { name.to_string() };
+    let key = caps_key(host, name);
     let hkey = format!("host:{host}");
     {
-        let g = st.lock().unwrap();
+        let g = caps_state().lock().unwrap();
         if let Some(v) = g.live.get(host) { return *v }
     }
-    let recently_down = st.lock().unwrap().down.get(host).map_or(false, |t| t.elapsed() < Duration::from_secs(600));
+    let recently_down = caps_state().lock().unwrap().down.get(host).map_or(false, |t| t.elapsed() < Duration::from_secs(600));
     let fetched = if recently_down { None } else { fetch_dolby(host).await };
-    let mut g = st.lock().unwrap();
+    let mut g = caps_state().lock().unwrap();
     if let Some(v) = fetched {
         tracing::info!(host, name, dolby = v, "cast receiver audio capability");
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         g.live.insert(host.to_string(), v);
         g.down.remove(host);
-        g.caps.insert(key, (v, now));
-        g.caps.insert(hkey, (v, now));
-        if let Ok(t) = serde_json::to_string_pretty(&g.caps) {
-            let _ = std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new(".")));
-            let _ = std::fs::write(&path, t);
+        for k in [key, hkey] {
+            let rec = g.caps.entry(k).or_insert(CapRec { dolby: v, at: now, hls: None });
+            rec.dolby = v;
+            rec.at = now;
         }
+        save_caps(&g.caps);
         return v;
     }
-    if !recently_down { g.down.insert(host.to_string(), Instant::now()) } else { None };
-    match g.caps.get(&key).or_else(|| g.caps.get(&hkey)).copied() {
-        Some((v, at)) => {
-            tracing::info!(host, name, dolby = v, checked_at = at, "cast receiver unreachable: using persisted audio capability");
-            v
+    if !recently_down { g.down.insert(host.to_string(), Instant::now()); }
+    match g.caps.get(&key).or_else(|| g.caps.get(&hkey)).cloned() {
+        Some(r) => {
+            tracing::info!(host, name, dolby = r.dolby, checked_at = r.at, "cast receiver unreachable: using persisted audio capability");
+            r.dolby
         }
         None => {
             tracing::info!(host, name, "cast receiver unreachable and capability unknown: assuming no Dolby (AAC)");
             false
         }
     }
+}
+
+/// One receiver in `receiver-caps.json`. The first format was a bare
+/// `[dolby, checked_at]` pair; both shapes load, objects are written.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct CapRec {
+    dolby: bool,
+    at: u64,
+    /// Does it play our on-demand HLS? None = never tried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hls: Option<bool>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum CapAny { Old((bool, u64)), New(CapRec) }
+
+struct CapsState {
+    caps: std::collections::HashMap<String, CapRec>,
+    live: std::collections::HashMap<String, bool>,
+    down: std::collections::HashMap<String, std::time::Instant>,
+}
+
+fn caps_path() -> std::path::PathBuf { crate::library::data_dir().join("receiver-caps.json") }
+
+fn caps_key(host: &str, name: &str) -> String {
+    if name.is_empty() { format!("host:{host}") } else { name.to_string() }
+}
+
+fn caps_state() -> &'static std::sync::Mutex<CapsState> {
+    static STATE: std::sync::OnceLock<std::sync::Mutex<CapsState>> = std::sync::OnceLock::new();
+    STATE.get_or_init(|| {
+        let mut caps = std::collections::HashMap::new();
+        if let Ok(t) = std::fs::read_to_string(caps_path()) {
+            if let Ok(v) = serde_json::from_str::<std::collections::HashMap<String, CapAny>>(&t) {
+                for (k, a) in v {
+                    caps.insert(k, match a { CapAny::Old((dolby, at)) => CapRec { dolby, at, hls: None }, CapAny::New(r) => r });
+                }
+            }
+        }
+        std::sync::Mutex::new(CapsState { caps, live: Default::default(), down: Default::default() })
+    })
+}
+
+fn save_caps(caps: &std::collections::HashMap<String, CapRec>) {
+    let path = caps_path();
+    if let Ok(t) = serde_json::to_string_pretty(caps) {
+        let _ = std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new(".")));
+        let _ = std::fs::write(&path, t);
+    }
+}
+
+/// Persisted answer to "does this receiver play our HLS?": None = unknown (try it).
+pub fn cast_hls_support(host: &str, name: &str) -> Option<bool> {
+    let g = caps_state().lock().unwrap();
+    g.caps.get(&caps_key(host, name)).or_else(|| g.caps.get(&format!("host:{host}"))).and_then(|r| r.hls)
+}
+
+/// Remember that HLS worked / failed on this receiver (keyed by name and host like Dolby).
+pub fn set_cast_hls_support(host: &str, name: &str, ok: bool) {
+    let mut g = caps_state().lock().unwrap();
+    for k in [caps_key(host, name), format!("host:{host}")] {
+        let rec = g.caps.entry(k).or_insert(CapRec { dolby: false, at: 0, hls: None });
+        rec.hls = Some(ok);
+    }
+    save_caps(&g.caps);
+    tracing::info!(host, name, hls = ok, "cast receiver HLS capability recorded");
 }
 
 async fn fetch_dolby(host: &str) -> Option<bool> {

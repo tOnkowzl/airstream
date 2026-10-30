@@ -20,6 +20,7 @@ Needs on PATH: `ffmpeg`/`ffprobe`, `openssl` (git-bash's is fine), `uv` (for Pla
 |---|---|
 | `test_cast_resilience.py` | warm channel doesn't launch; Play/Play again; Stop never auto-relaunches; silent player close → `transport play` 409 → Play relaunches; half-open socket → reconnect < 8 s; TV off → 502 < 15 s |
 | `test_audio_compat.py` | no-Dolby receiver: E-AC-3 5.1 → AAC 6ch with bit-identical video; AAC source untouched |
+| `test_hls.py` | on-demand HLS is the default for Original quality: instant Play, fMP4 LOAD fields, segment at the resume position (audio copied / E-AC-3→AAC 6ch + note), prepare_only is instant, `/vod/` open on LAN while the API stays blocked, receiver that rejects HLS → same Play falls back to MP4 and is remembered (`hls:false`) |
 | `test_ui_play.py` | UI Play button, relaunch after silent close, click spam → exactly one LOAD |
 
 Tests run sequentially: the mock eureka endpoint must bind `127.0.0.1:8443` (fixed by the app).

@@ -112,6 +112,7 @@ function readSettings() {
     resume: $('#sResume').checked,
     last_device: deviceId,
     last_item: selected || '',
+    stream_mode: (STATE.prefs && STATE.prefs.settings && STATE.prefs.settings.stream_mode) || 'auto',
   };
 }
 

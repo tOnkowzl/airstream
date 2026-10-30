@@ -124,7 +124,13 @@ pub struct Settings {
     pub audio_track: i32,
     /// index within the subtitle streams, -1 = off
     pub subtitle_track: i32,
+    /// auto = instant on-demand HLS when the receiver accepts it, else prepared MP4;
+    /// prepare = always the prepared MP4 path.
+    #[serde(default = "default_stream_mode")]
+    pub stream_mode: String,
 }
+
+fn default_stream_mode() -> String { "auto".into() }
 
 fn normal_playback_rate() -> f64 { 1.0 }
 
@@ -151,6 +157,7 @@ impl Default for Settings {
             hls_segment: 4,
             audio_track: -1,
             subtitle_track: -1,
+            stream_mode: default_stream_mode(),
         }
     }
 }

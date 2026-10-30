@@ -15,6 +15,8 @@
 
 mod devices;
 mod dropfind;
+mod hls_vod;
+mod mkv_index;
 mod cast;
 mod library;
 mod probe;
@@ -94,6 +96,7 @@ async fn main() {
         }
         _ = window_lifetime::wait_until_closed() => {
             server::save_resume_now(&state, &mut String::new());
+            state.hls.stop_all();
             tracing::info!("last app window closed; backend shutting down");
         }
     }

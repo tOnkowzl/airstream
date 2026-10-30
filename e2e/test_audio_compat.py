@@ -28,7 +28,7 @@ app = App("audio", mock_port=tv.port)
 try:
     app.start()
     dev = app.device_id
-    s = app.set_settings(quality="passthrough", last_device=dev)
+    s = app.set_settings(quality="passthrough", last_device=dev, stream_mode="prepare")  # this test inspects the prepared MP4
 
     # --- E-AC-3 5.1 source
     src = media["eac3"]

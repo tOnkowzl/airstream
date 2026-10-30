@@ -15,7 +15,7 @@ try:
     app.start()
     dev = app.device_id
     item = app.add(media["aac"])
-    s = app.set_settings(quality="passthrough", last_device=dev, last_item=item)
+    s = app.set_settings(quality="passthrough", last_device=dev, last_item=item, stream_mode="prepare")  # prepared-MP4 path; HLS default is covered by test_hls.py
     app.prepare(item, s)
     play = lambda: app.post_status("/api/cast", {"device": dev, "id": item})
 

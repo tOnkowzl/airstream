@@ -8,3 +8,6 @@ target-hls/
 tools/hls_proto/rust_verify/cache/
 tools/hls_proto/rust_verify/vtmp_*/
 target-fix/
+target-int/
+target-hls/
+__pycache__/

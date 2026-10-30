@@ -4,7 +4,7 @@ Only what Airstream needs: heartbeat, receiver GET_STATUS/LAUNCH, media
 LOAD/GET_STATUS/PLAY/PAUSE/SEEK/STOP.  Test hooks simulate the real-world
 failures: player closed silently by the TV, half-open sockets, TV powered off.
 """
-import http.server, json, os, shutil, socket, ssl, struct, subprocess, threading, time
+import http.server, json, os, re, shutil, socket, ssl, struct, subprocess, threading, time, urllib.parse, urllib.request
 
 NOWIN = 0x08000000
 NS_CONN = "urn:x-cast:com.google.cast.tp.connection"
@@ -120,11 +120,20 @@ class _Conn:
 
 
 class MockReceiver:
-    def __init__(self, launch_delay=0.0, load_delay=0.0, duration=60.0, stop_closes_player=True):
+    def __init__(self, launch_delay=0.0, load_delay=0.0, duration=60.0, stop_closes_player=True, hls_mode=None, fetch_dir=None):
         self.launch_delay = launch_delay
         self.load_delay = load_delay
         self.duration = duration
         self.stop_closes_player = stop_closes_player
+        # hls_mode: None = HLS LOAD treated like any URL (old behaviour);
+        # 'play'  = fetch master/index/init/segment-at-currentTime, then PLAYING;
+        # 'reject' = LOAD_FAILED for m3u8 content, MP4 keeps working.
+        self.hls_mode = hls_mode
+        self.fetch_dir = fetch_dir      # fetched init/segment bytes are saved here (for ffprobe)
+        self.load_msgs = []             # full media object of every accepted/rejected LOAD
+        self.hls_loads = 0              # LOADs with an m3u8 content type (accepted or not)
+        self.fetched = []               # (url path, status, bytes) of every HTTP GET done for HLS
+        self.fetched_files = {}         # 'init' / 'seg<N>' -> saved file path
         self.launches = 0
         self.loads = 0
         self.connections = 0
@@ -303,6 +312,53 @@ class MockReceiver:
                 else:
                     self._broadcast(NS_MEDIA, msg)
 
+    def _get(self, url):
+        try:
+            with urllib.request.urlopen(url, timeout=60) as r:
+                data = r.read()
+                self.fetched.append((urllib.parse.urlparse(url).path, r.status, len(data), r.headers.get("Content-Type", "")))
+                return data
+        except Exception as e:
+            self.fetched.append((urllib.parse.urlparse(url).path, 0, 0, repr(e)))
+            return None
+
+    def _fetch_hls(self, master_url, t):
+        """Behave like a player: master -> index -> init -> the segment containing t."""
+        master = self._get(master_url)
+        if master is None:
+            return False
+        idx_rel = [l for l in master.decode().splitlines() if l and not l.startswith("#")]
+        if not idx_rel:
+            return False
+        idx_url = urllib.parse.urljoin(master_url, idx_rel[0])
+        index = self._get(idx_url)
+        if index is None:
+            return False
+        lines = index.decode().splitlines()
+        mp = [re.search(r'URI="([^"]+)"', l) for l in lines if l.startswith("#EXT-X-MAP")]
+        init = self._get(urllib.parse.urljoin(idx_url, mp[0].group(1))) if mp and mp[0] else None
+        acc, target, n = 0.0, None, 0
+        durs = [float(l.split(":")[1].rstrip(",")) for l in lines if l.startswith("#EXTINF")]
+        names = [l for l in lines if l and not l.startswith("#")]
+        for i, d in enumerate(durs):
+            if acc <= t < acc + d:
+                target = i
+                break
+            acc += d
+        if target is None:
+            target = len(names) - 1
+        seg = self._get(urllib.parse.urljoin(idx_url, names[target]))
+        if init is None or seg is None:
+            return False
+        self.hls_target = target
+        if self.fetch_dir:
+            os.makedirs(self.fetch_dir, exist_ok=True)
+            pi, ps = os.path.join(self.fetch_dir, "init.mp4"), os.path.join(self.fetch_dir, "seg.m4s")
+            open(pi, "wb").write(init)
+            open(ps, "wb").write(init + seg)  # init + media segment = playable fMP4
+            self.fetched_files = {"init": pi, "seg": ps, "seg_index": target}
+        return True
+
     def _launch(self, rid):
         time.sleep(self.launch_delay)
         with self._lock:
@@ -315,8 +371,20 @@ class MockReceiver:
 
     def _load(self, m, rid):
         time.sleep(self.load_delay)
+        media = m.get("media", {})
+        is_hls = "mpegurl" in str(media.get("contentType", "")).lower() or ".m3u8" in str(media.get("contentId", ""))
+        if is_hls:
+            with self._lock:
+                self.hls_loads += 1
+                self.load_msgs.append({"currentTime": m.get("currentTime"), "media": media})
         if not (self.player_open and self.powered):
             self._broadcast(NS_MEDIA, {"type": "LOAD_FAILED", "requestId": rid})
+            return
+        if is_hls and self.hls_mode == "reject":
+            self._broadcast(NS_MEDIA, {"type": "LOAD_FAILED", "requestId": rid, "detail": {"reason": "mock rejects HLS"}})
+            return
+        if is_hls and self.hls_mode == "play" and not self._fetch_hls(media.get("contentId", ""), float(m.get("currentTime") or 0)):
+            self._broadcast(NS_MEDIA, {"type": "LOAD_FAILED", "requestId": rid, "detail": {"reason": "mock could not fetch HLS"}})
             return
         with self._lock:
             self.loads += 1

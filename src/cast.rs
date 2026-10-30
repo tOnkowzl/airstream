@@ -572,8 +572,17 @@ pub async fn connect_opts(host: &str, port: u16, device_name: &str, launch: bool
     Ok(client)
 }
 
+/// What the LOAD points at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadKind {
+    /// A progressive MP4 (direct or prepared).
+    Mp4,
+    /// On-demand fMP4 HLS VOD (finite playlist, receiver seeks by itself).
+    HlsVod,
+}
+
 /// Loads a media URL into the (already launched) Default Media Receiver.
-pub fn load(client: &CastClient, url: &str, title: &str, hls: bool, subtitle: Option<Value>, subtitle_scale: f64, playback_rate: f64, start_at: f64) -> bool {
+pub fn load(client: &CastClient, url: &str, title: &str, kind: LoadKind, subtitle: Option<Value>, subtitle_scale: f64, playback_rate: f64, start_at: f64) -> bool {
     let st = client.status();
     if st.transport_id.is_empty() { return false }
     {
@@ -591,14 +600,19 @@ pub fn load(client: &CastClient, url: &str, title: &str, hls: bool, subtitle: Op
         status.active_track_ids.clear();
         status.media_tracks.clear();
     }
+    let hls = kind == LoadKind::HlsVod;
     let content_type = if hls { "application/x-mpegurl" } else { "video/mp4" };
     let mut payload = json!({
         "type": "LOAD", "autoplay": true, "currentTime": start_at.max(0.0), "activeTrackIds": [], "playbackRate": playback_rate,
         "media": {
-            "contentId": url, "streamType": if hls { "LIVE" } else { "BUFFERED" },
+            "contentId": url, "streamType": "BUFFERED",
             "contentType": content_type, "metadata": { "type": 0, "title": title }, "tracks": []
         }
     });
+    if hls {
+        payload["media"]["hlsSegmentFormat"] = json!("fmp4");
+        payload["media"]["hlsVideoSegmentFormat"] = json!("fmp4");
+    }
     if let Some(track) = subtitle {
         payload["media"]["tracks"] = json!([track]);
         payload["activeTrackIds"] = json!([1]);
